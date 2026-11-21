@@ -68,6 +68,10 @@ class Bot:
         self.sequence_at = -2
         self.sequence_key = None
         self.sequence_first = None
+        self.discovered_tiles = set()
+        self.scan_tick = -2
+        self.explore_goal = None
+        self.explore_at = -2
         try:
             self.surface = RewardSurface(hello["map"]["dir"])
         except (OSError, KeyError, ValueError, EOFError):
@@ -368,6 +372,47 @@ class Bot:
         p, now = me["pos"], obs["t"]
         goal, stop = self.destination(obs)
         goal, stop = self.resource_sequence(obs,goal,stop)
+        if now < 100 and (not me["weapons"][1] or me["weapons"][1]["kind"]=="mortar"):
+            cell = 28
+            if now-self.scan_tick >= .65:
+                self.scan_tick = now
+                x,y=math.floor(p[0]/cell),math.floor(p[1]/cell)
+                yaw=me["aim"][0]
+                ux,uy=math.cos(yaw),math.sin(yaw)
+                for i in range(x-4,x+5):
+                    for j in range(y-4,y+5):
+                        dx,dy=(i+.5)*cell-p[0],(j+.5)*cell-p[1]
+                        radius=math.hypot(dx,dy)
+                        if radius<35 or (radius<116 and dx*ux+dy*uy>.6*radius):
+                            self.discovered_tiles.add((i,j))
+            waiting = any(distance(goal,point)<8 for point in self.resource_targets)
+            known = any(it["kind"] in ("laser","lightning") and now-seen<9 and
+                        distance(p,it["pos"])<125 and self.reachable_reward(p,it["pos"])
+                        for it,seen in self.items["pickups"].values())
+            near_box = any(distance(p,c["pos"])<44 for c in obs["crates"])
+            z=obs["zone"]
+            if (not (known or waiting or near_box) and me["in_zone"] and
+                    me["hp"]>.52*me["max_hp"] and distance(p,z["center"])<z["radius"]-28):
+                if self.explore_goal is None or now-self.explore_at>=2.5 or distance(p,self.explore_goal)<7:
+                    options=[]
+                    for i in range(16):
+                        a=self.phase+i*math.tau/16
+                        dx,dy=math.cos(a),math.sin(a)
+                        pt=(p[0]+55*dx,p[1]+55*dy)
+                        if distance(pt,z["center"])>z["radius"]-14:continue
+                        gain=0
+                        for depth in (45,75,105):
+                            for side in (-35,0,35):
+                                k=(math.floor((p[0]+depth*dx-side*dy)/cell),
+                                   math.floor((p[1]+depth*dy+side*dx)/cell))
+                                gain+=k not in self.discovered_tiles
+                        continuity=0 if self.explore_goal is None else 1-.012*distance(pt,self.explore_goal)
+                        cost=max(0,distance(pt,z["next_center"])-z["next_radius"])*.015
+                        options.append((gain+continuity-cost-.004*distance(pt,goal),pt))
+                    self.explore_goal=max(options)[1] if options else None
+                    self.explore_at=now
+                if self.explore_goal is not None:
+                    goal,stop=self.explore_goal,0
         resting = distance(p, goal) <= max(0.6, stop)
         dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
         if me["energy"] < 0.24 * me["max_energy"]:
