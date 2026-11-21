@@ -9,6 +9,7 @@ from pathlib import Path
 # Also supports Python's isolated embedded distribution.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mechfight
+from routes import TileRoutes
 
 
 def distance(a, b):
@@ -62,16 +63,15 @@ class Bot:
         self.last_reverse = -10
         self.items = {"cubes": {}, "pickups": {}, "crates": {}}
         self.last_goal = None
-        self.recover_until = -1
-        self.last_health = None
-        self.drop_progress = {}
-        self.drop_cooldown = {}
-        self.mobility_heading = (0, 0)
-        self.headings = tuple((math.cos(a * math.tau / 16), math.sin(a * math.tau / 16)) for a in range(16))
         try:
             self.surface = RewardSurface(hello["map"]["dir"])
         except (OSError, KeyError, ValueError, EOFError):
             self.surface = None
+        self.routes = None
+        if self.surface:
+            world=json.loads((Path(hello["map"]["dir"]) / "v2/world.json").read_bytes())
+            self.routes=TileRoutes(world["bounds"],world["prisms"],
+                lambda x,y: -self.surface.above_tile((x,y,0)), self.config["mech"])
 
     def reachable_reward(self, p, reward):
         if abs(reward[2] - p[2]) < 8:
@@ -82,58 +82,6 @@ class Bot:
         # the collectible's height *above its tile* signals a raised platform.
         return (self.surface.above_tile(reward) < 4
                 or abs(self.surface.above_tile(reward) - self.surface.above_tile(p)) < 6)
-
-    def recovery_route(self, obs, destination, stop):
-        """Optimize a short walk against the future safe circle and crowding.
-
-        A drop with almost-complete progress is worth finishing when damaged.
-        Otherwise the regeneration timer gives the avatar an incentive to stay
-        in quiet parts of the game circle continuously for several seconds.
-        """
-        me, zone, now = obs["self"], obs["zone"], obs["t"]
-        p = me["pos"]
-        health = me["hp"] / max(1, me["max_hp"])
-        if self.last_health is not None and health + 0.014 < self.last_health:
-            self.recover_until = now + me["stats"].get("regen_delay", 5) + 3
-        self.last_health = health
-        crowd = [m["pos"] for m in obs["mechs"] if m["kind"] == "mech" and distance(p, m["pos"]) < 160]
-        close = min((distance(p, q) for q in crowd), default=200)
-        if not crowd or (close > 110 and now >= self.recover_until):
-            return destination, stop
-        if any(d["holder"] == me["id"] and d["progress"] >= 1.4
-               and self.drop_cooldown.get(d["id"], -1) < now for d in obs["drops"]):
-            return destination, stop
-        duration = max(0.1, zone["shrink_end"] - max(now, zone["shrink_start"]))
-        step = min(39, max(5, zone["radius"] * 0.32))
-        horizon = step / max(1, me["stats"]["walk_speed"])
-        interest = direction(p, destination)
-        recovering = now < self.recover_until or close < 62
-        def circle(h):
-            f = min(1, max(0, (now + h - max(now, zone["shrink_start"])) / duration))
-            c = [a + (b - a) * f for a,b in zip(zone["center"], zone["next_center"])]
-            radius = zone["radius"] + (zone["next_radius"] - zone["radius"]) * f
-            return c, radius
-        c1,r1 = circle(horizon / 2)
-        c2,r2 = circle(horizon)
-        directions = [interest, self.mobility_heading]
-        directions.extend(self.headings)
-        def utility(move):
-            dx,dy=move
-            mid = (p[0]+step*0.5*dx,p[1]+step*0.5*dy)
-            end = (p[0]+step*dx,p[1]+step*dy)
-            debt = max(0, distance(c1,mid)-max(0,r1-3))+max(0,distance(c2,end)-max(0,r2-4))
-            distances = [distance(end,q) for q in crowd]
-            clear = min(145,min(distances))
-            clustered = sum(max(0,95-gap) for gap in distances)
-            regain = (1.45 if recovering else 0.82) * clear - 0.23 * clustered
-            toward = (interest[0]*dx + interest[1]*dy) * step
-            smooth = (self.mobility_heading[0]*dx + self.mobility_heading[1]*dy)
-            return regain + (0.34 if recovering else 0.94)*toward - 5*debt + 4*smooth
-        move = max(directions,key=utility)
-        self.mobility_heading = move
-        if move == interest:
-            return destination, stop
-        return (p[0]+step*move[0],p[1]+step*move[1]),0
 
     def remember(self, obs):
         """Remember static collectibles across short gaps in visibility."""
@@ -146,29 +94,11 @@ class Bot:
             for obj in obs[group]:
                 memory[obj["id"]] = (obj, now)
 
-    def contested_drops(self, obs):
-        """Stop paying the time cost of a capture when its game clock freezes."""
-        now, me = obs["t"], obs["self"]
-        for obj in obs["drops"]:
-            key = obj["id"]
-            progress, since = self.drop_progress.get(key, (-1, now))
-            clock = obj["progress"]
-            if obj["holder"] != me["id"] or obj["lands_in"] > 0:
-                self.drop_progress[key] = (clock, now)
-            elif clock > progress + 0.015 or clock < progress - 0.015:
-                self.drop_progress[key] = (clock, now)
-                self.drop_cooldown.pop(key, None)
-            elif now - since > 1.3 and any(
-                    m["kind"] == "mech" and distance(m["pos"], obj["pos"]) <= obj["radius"] + 2
-                    for m in obs["mechs"]):
-                self.drop_cooldown[key] = now + 4.5
-
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
         p, center = me["pos"], zone["next_center"]
         speed = max(1, me["stats"]["walk_speed"])
         self.remember(obs)
-        self.contested_drops(obs)
         time_left = max(0, zone["shrink_end"] - obs["t"])
         # Reserve walking time for the closing circle before seeking rewards.
         def travel_slack(target):
@@ -188,7 +118,7 @@ class Bot:
                 bonus = (75 if me["cubes"] < 3 else 54) - (obs["t"] - seen) * 0.9
                 goals.append((obj["pos"], bonus, 0))
         for obj in obs["drops"]:
-            if obj["holder"] not in (None, me["id"]) or self.drop_cooldown.get(obj["id"], -1) > obs["t"]:
+            if obj["holder"] not in (None, me["id"]):
                 continue
             arrival = distance(p, obj["pos"]) / speed
             wait = max(0, obj["lands_in"] - arrival)
@@ -301,7 +231,13 @@ class Bot:
         me = obs["self"]
         p, now = me["pos"], obs["t"]
         goal, stop = self.destination(obs)
-        goal, stop = self.recovery_route(obs, goal, stop)
+        # Apply the walking graph to empty-circle and collectible navigation.
+        # Crowded observations retain the incumbent's independent local policy.
+        if (self.routes and not any(m["kind"] == "mech" and distance(m["pos"],p)<75 for m in obs["mechs"])
+                and distance(p,goal)>10 and abs(self.surface.above_tile(p))<5):
+            walk_goal=self.routes.waypoint(p,goal,now)
+            if walk_goal != goal:
+                goal,stop=walk_goal,1
         resting = distance(p, goal) <= max(0.6, stop)
         dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
         if me["energy"] < 0.24 * me["max_energy"]:
@@ -337,17 +273,10 @@ class Bot:
 
         # Use the game's basic point-and-click interaction on visible sprites.
         primary = me["weapons"][0]
-        visible = [m for m in obs["mechs"] if distance(p, m["pos"]) < primary["stats"]["range"]]
-        rivals = [m for m in visible if m["kind"] == "mech"]
-        # Drones grant no placement point and become active when interacted
-        # with. Harvest their cubes only in the opening when already nearby.
-        useful_drones = [m for m in visible if m["kind"] == "npc" and
-                         ((me["cubes"] < 3 and distance(p, m["pos"]) <= 44)
-                          or distance(p, m["pos"]) <= 18)]
-        actors = rivals or useful_drones
+        actors = [m for m in obs["mechs"] if distance(p, m["pos"]) < primary["stats"]["range"]]
         if active_arc:
-            arcade_range = [m for m in rivals if distance(p, m["pos"]) < held["stats"]["range"]]
-            actors = arcade_range or actors
+            scored = [m for m in actors if m["kind"] == "mech" and distance(p, m["pos"]) < held["stats"]["range"]]
+            actors = scored or actors
         objects = actors or [c for c in obs["crates"] if distance(p, c["pos"]) < 80]
         if objects:
             target = min(objects, key=lambda obj: distance(p, obj["pos"]) + 0.023 * obj["hp"])
