@@ -32,11 +32,25 @@ class Bot:
         self.last_step = None
         self.obstruction = deque(maxlen=7)
         self.last_reverse = -10
+        self.items = {"cubes": {}, "pickups": {}, "crates": {}}
+        self.last_goal = None
+
+    def remember(self, obs):
+        """Remember static collectibles across short gaps in visibility."""
+        p, now = obs["self"]["pos"], obs["t"]
+        for group, memory in self.items.items():
+            visible = {obj["id"] for obj in obs[group]}
+            for key, (obj, seen) in list(memory.items()):
+                if key not in visible and (now - seen > 14 or distance(p, obj["pos"]) < 7):
+                    del memory[key]
+            for obj in obs[group]:
+                memory[obj["id"]] = (obj, now)
 
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
         p, center = me["pos"], zone["next_center"]
         speed = max(1, me["stats"]["walk_speed"])
+        self.remember(obs)
         time_left = max(0, zone["shrink_end"] - obs["t"])
         # Reserve walking time for the closing circle before seeking rewards.
         def travel_slack(target):
@@ -51,9 +65,10 @@ class Bot:
             a = angle + i * math.tau / 10
             pt = (center[0] + radius * math.cos(a), center[1] + radius * math.sin(a))
             goals.append((pt, 0, 0))
-        for obj in obs["cubes"]:
+        for obj, seen in self.items["cubes"].values():
             if abs(obj["pos"][2] - p[2]) < 11:
-                goals.append((obj["pos"], 52, 0))
+                bonus = (75 if me["cubes"] < 3 else 54) - (obs["t"] - seen) * 0.9
+                goals.append((obj["pos"], bonus, 0))
         for obj in obs["drops"]:
             if obj["holder"] not in (None, me["id"]):
                 continue
@@ -61,27 +76,52 @@ class Bot:
             wait = max(0, obj["lands_in"] - arrival)
             healing = 1 - me["hp"] / max(1, me["max_hp"])
             bonus = 84 + healing * 95 - min(100, wait * 4)
-            goals.append((obj["pos"], bonus, obj["radius"] * 0.48))
+            if obj["holder"] == me["id"]:
+                bonus += 30 * obj["progress"]
+            # Standing near the edge still captures. Pick a point reachable
+            # from our side of the ring, preserving already banked time.
+            rad = obj["radius"] * 0.70
+            if distance(p, obj["pos"]) < rad:
+                focus = p
+            else:
+                vx, vy = direction(obj["pos"], p)
+                focus = (obj["pos"][0] + vx * rad, obj["pos"][1] + vy * rad)
+            goals.append((focus, bonus, 0.7))
         if me["weapons"][1] is None:
-            for obj in obs["pickups"]:
+            for obj, seen in self.items["pickups"].values():
                 if obj["kind"] != "gun" and abs(obj["pos"][2] - p[2]) < 10:
-                    goals.append((obj["pos"], 48, 0))
-        for obj in obs["crates"]:
+                    goals.append((obj["pos"], 48 - (obs["t"] - seen), 0))
+        for obj, seen in self.items["crates"].values():
             if me["cubes"] < 6 and abs(obj["pos"][2] - p[2]) < 10:
-                goals.append((obj["pos"], 25, 6))
+                goals.append((obj["pos"], 36 - (obs["t"] - seen), 6))
+
+        # Pick local waypoints when the next circle is far away. They adapt to
+        # the current avatar density while preserving time to reach that circle.
+        if crowd:
+            step = min(45, max(8, zone["radius"] * 0.20))
+            for i in range(12):
+                angle = i * math.tau / 12 + self.phase
+                pt = (p[0] + step * math.cos(angle), p[1] + step * math.sin(angle))
+                reserve = max(0, distance(pt, center) - 0.85 * zone["next_radius"])
+                goals.append((pt, 14 - reserve * 0.36, 0))
 
         def score(goal):
             pt, reward, stop = goal
             slack = travel_slack(pt)
             boundary = distance(pt, zone["center"]) - zone["radius"] + 6
             exposure = sum(max(0, 72 - distance(pt, other)) for other in crowd)
-            return (reward - 0.46 * max(0, distance(p, pt) - stop)
+            continuity = 8 if self.last_goal and distance(pt, self.last_goal) < 5 else 0
+            return (reward + continuity - 0.46 * max(0, distance(p, pt) - stop)
                     - 0.68 * exposure - 2 * max(0, boundary)
                     - 12 * max(0, 2 - slack))
 
-        if distance(p, zone["center"]) >= zone["radius"] - 5 or travel_slack(p) <= 1:
+        # At the end of a phase the old travel-time estimate becomes zero
+        # even when we are safely inside the next circle.
+        if (distance(p, zone["center"]) >= zone["radius"] - 2
+                or (travel_slack(p) <= 1 and distance(p, center) > max(2,zone["next_radius"] - 8))):
             return center, 0
         best, _, stop = max(goals, key=score)
+        self.last_goal = tuple(best[:2])
         return best, stop
 
     def navigate(self, p, goal, resting, now, speed):
