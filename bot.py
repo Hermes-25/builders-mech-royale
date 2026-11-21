@@ -1,5 +1,7 @@
 """Game policy for the mechfight/1 JSON observation stream."""
 from collections import deque
+from array import array
+import json
 import math
 import sys
 from pathlib import Path
@@ -19,6 +21,32 @@ def direction(a, b):
     return dx / scale, dy / scale
 
 
+class RewardSurface:
+    """Estimate elevation above the game's tile grid for pickup accessibility."""
+
+    def __init__(self, folder):
+        root = Path(folder) / "v2"
+        grid = json.loads((root / "world.json").read_bytes())["terrain"]
+        data = array("h")
+        with (root / grid["file"]).open("rb") as stream:
+            data.fromfile(stream, grid["nx"] * grid["ny"])
+        if sys.byteorder != "little":
+            data.byteswap()
+        self.grid, self.data = grid, data
+
+    def above_tile(self, point):
+        g = self.grid
+        gx = min(g["nx"] - 1.001, max(0, (point[0] - g["minX"]) / g["step"]))
+        gy = min(g["ny"] - 1.001, max(0, (point[1] - g["minY"]) / g["step"]))
+        x, y = int(gx), int(gy)
+        i = y * g["nx"] + x
+        fx, fy = gx - x, gy - y
+        low = self.data[i] * (1 - fx) + self.data[i + 1] * fx
+        j = i + g["nx"]
+        high = self.data[j] * (1 - fx) + self.data[j + 1] * fx
+        return point[2] - g["scale"] * (low * (1 - fy) + high * fy)
+
+
 class Bot:
     name = "Afterglow"
 
@@ -34,6 +62,20 @@ class Bot:
         self.last_reverse = -10
         self.items = {"cubes": {}, "pickups": {}, "crates": {}}
         self.last_goal = None
+        try:
+            self.surface = RewardSurface(hello["map"]["dir"])
+        except (OSError, KeyError, ValueError, EOFError):
+            self.surface = None
+
+    def reachable_reward(self, p, reward):
+        if abs(reward[2] - p[2]) < 8:
+            return True
+        if self.surface is None:
+            return abs(reward[2] - p[2]) < 11
+        # A collectible on a downhill tile can be well below the avatar; only
+        # the collectible's height *above its tile* signals a raised platform.
+        return (self.surface.above_tile(reward) < 4
+                or abs(self.surface.above_tile(reward) - self.surface.above_tile(p)) < 6)
 
     def remember(self, obs):
         """Remember static collectibles across short gaps in visibility."""
@@ -66,7 +108,7 @@ class Bot:
             pt = (center[0] + radius * math.cos(a), center[1] + radius * math.sin(a))
             goals.append((pt, 0, 0))
         for obj, seen in self.items["cubes"].values():
-            if abs(obj["pos"][2] - p[2]) < 11:
+            if self.reachable_reward(p, obj["pos"]):
                 bonus = (75 if me["cubes"] < 3 else 54) - (obs["t"] - seen) * 0.9
                 goals.append((obj["pos"], bonus, 0))
         for obj in obs["drops"]:
@@ -87,12 +129,15 @@ class Bot:
                 vx, vy = direction(obj["pos"], p)
                 focus = (obj["pos"][0] + vx * rad, obj["pos"][1] + vy * rad)
             goals.append((focus, bonus, 0.7))
-        if me["weapons"][1] is None:
+        held = me["weapons"][1]
+        if not held or held["kind"] != "lightning":
             for obj, seen in self.items["pickups"].values():
-                if obj["kind"] != "gun" and abs(obj["pos"][2] - p[2]) < 10:
-                    goals.append((obj["pos"], 48 - (obs["t"] - seen), 0))
+                desired = obj["kind"] == "lightning" or (not held and obj["kind"] != "gun")
+                if desired and self.reachable_reward(p, obj["pos"]):
+                    value = 89 if obj["kind"] == "lightning" else 43
+                    goals.append((obj["pos"], value - (obs["t"] - seen), 0))
         for obj, seen in self.items["crates"].values():
-            if me["cubes"] < 6 and abs(obj["pos"][2] - p[2]) < 10:
+            if me["cubes"] < 6 and self.reachable_reward(p, obj["pos"]):
                 goals.append((obj["pos"], 36 - (obs["t"] - seen), 6))
 
         # Pick local waypoints when the next circle is far away. They adapt to
@@ -189,22 +234,36 @@ class Bot:
         action = {"tick": obs["tick"], "move": [dx, dy],
                   "boost": self.boosting and not resting and (me["grounded"] or blocked),
                   "jump": blocked and me["grounded"]}
+        held = me["weapons"][1]
+        arc = held and held["kind"] == "lightning"
+        active_arc = arc and any(distance(p, m["pos"]) < held["stats"]["range"] for m in obs["mechs"])
+        if active_arc and me["energy"] < 0.65 * me["max_energy"]:
+            action["boost"] = False
         if obs["offer"]:
             preference = ("plating", "nanites", "armor", "gun_rate", "gun_damage",
                           "servos", "reactor", "jets", "capacitor")
+            if arc:
+                preference = ("lightning_efficiency", "lightning_range", "plating",
+                              "lightning_chain", "armor", "nanites", "reactor") + preference
             choices = obs["offer"]["choices"]
             action["pick"] = max(range(len(choices)), key=lambda i:
                 len(preference) - preference.index(choices[i]["id"]) if choices[i]["id"] in preference else 0)
-        if me["weapons"][1] is None:
-            for item in obs["pickups"]:
-                if (item["kind"] != "gun" and abs(item["pos"][2] - p[2]) < 4
-                        and distance(p, item["pos"]) < self.config["loot"]["pickup_radius"]):
-                    action["take"] = item["id"]
-                    break
+        if not arc:
+            nearby = [item for item in obs["pickups"] if
+                      (item["kind"] == "lightning" or (not held and item["kind"] != "gun"))
+                      and abs(item["pos"][2] - p[2]) < 4
+                      and distance(p, item["pos"]) < self.config["loot"]["pickup_radius"]]
+            if nearby and not (held and held.get("charge", 0) > 0):
+                action["take"] = max(nearby, key=lambda obj: obj["kind"] == "lightning")["id"]
+                if held:
+                    action["drop"] = 1
 
         # Use the game's basic point-and-click interaction on visible sprites.
         primary = me["weapons"][0]
         actors = [m for m in obs["mechs"] if distance(p, m["pos"]) < primary["stats"]["range"]]
+        if active_arc:
+            scored = [m for m in actors if m["kind"] == "mech" and distance(p, m["pos"]) < held["stats"]["range"]]
+            actors = scored or actors
         objects = actors or [c for c in obs["crates"] if distance(p, c["pos"]) < 80]
         if objects:
             target = min(objects, key=lambda obj: distance(p, obj["pos"]) + 0.023 * obj["hp"])
