@@ -389,7 +389,8 @@ class Bot:
             known = any(it["kind"] in ("laser","lightning") and now-seen<9 and
                         distance(p,it["pos"])<125 and self.reachable_reward(p,it["pos"])
                         for it,seen in self.items["pickups"].values())
-            near_box = any(distance(p,c["pos"])<44 for c in obs["crates"])
+            near_box = me["cubes"] < 6 and any(
+                distance(p,c["pos"]) < 24 and self.reachable_reward(p,c["pos"]) for c in obs["crates"])
             z=obs["zone"]
             if (not (known or waiting or near_box) and me["in_zone"] and
                     me["hp"]>.52*me["max_hp"] and distance(p,z["center"])<z["radius"]-28):
