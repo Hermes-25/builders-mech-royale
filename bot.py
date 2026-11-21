@@ -63,8 +63,6 @@ class Bot:
         self.items = {"cubes": {}, "pickups": {}, "crates": {}}
         self.last_goal = None
         self.resource_targets = set()
-        self.cube_snapshot = None
-        self.overlaps = []
         self.item_values = {}
         self.next_swap = 0
         try:
@@ -102,46 +100,6 @@ class Bot:
         self.item_values={"laser":88+12*bonus+5*(len(rivals)>near),
                           "lightning":72+15*min(near,3),
                           "mortar":34, "gun":-100}
-
-    def overlap_goals(self, obs, cubes, milestone):
-        """Add reachable positions inside multiple pickup circles at once."""
-        me=obs["self"];p=me["pos"]
-        known=sorted((c for c,seen in cubes if obs["t"]-seen<3.5 and self.reachable_reward(p,c["pos"])),
-                     key=lambda c: distance(p,c["pos"]))[:16]
-        snapshot=tuple(sorted(c["id"] for c in known))
-        if snapshot != self.cube_snapshot:
-            self.cube_snapshot=snapshot
-            self.overlaps=[]
-            points=[c["pos"] for c in known]
-            radius=max(0.4,self.config["cubes"]["pickup_radius"]-0.45)
-            kept={}
-            for i,q in enumerate(points):
-                for other in points[i+1:]:
-                    dx,dy=other[0]-q[0],other[1]-q[1]
-                    sep=math.hypot(dx,dy)
-                    if abs(other[2]-q[2])>3 or not 0.05<sep<2*radius:continue
-                    mx,my=(q[0]+other[0])/2,(q[1]+other[1])/2
-                    k=math.sqrt(max(0,radius*radius-sep*sep/4))/sep
-                    # The midpoint is robust to quantization. The two disk
-                    # intersections also expose triples around a common point.
-                    for x,y in ((mx,my),(mx-k*dy,my+k*dx),(mx+k*dy,my-k*dx)):
-                        z=(q[2]+other[2])/2
-                        near=[distance((x,y),n) for n in points if abs(n[2]-z)<3.5]
-                        immediate=sum(d<=radius+.02 for d in near)
-                        local=min(4,sum(d<=13 for d in near))
-                        if immediate<2:continue
-                        key=(round(x),round(y),round(z))
-                        value=(immediate,local)
-                        if key not in kept or value>kept[key][1]:
-                            kept[key]=((x,y,z),value)
-            self.overlaps=list(kept.values())
-        scored=[]
-        for q,(immediate,local) in self.overlaps:
-            bonus=(75 if me["cubes"]<3 else 54)+(local-1)*18+(min(4,immediate)-1)*13
-            bonus+=20*(me["cubes"]+local>=milestone)
-            scored.append((bonus-0.46*distance(p,q),q,bonus))
-        scored.sort(reverse=True)
-        return [(q,bonus,0) for _,q,bonus in scored[:6]]
 
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
@@ -186,9 +144,6 @@ class Bot:
                 bonus += (gain-1)*18 + 20*(me["cubes"]+gain>=next_milestone)
                 resources.add(tuple(obj["pos"][:2]))
                 goals.append((obj["pos"], bonus, 0))
-        for approach,bonus,stop in self.overlap_goals(obs,cubes,next_milestone):
-            resources.add(tuple(approach[:2]))
-            goals.append((approach,bonus,stop))
         for obj in obs["drops"]:
             if obj["holder"] not in (None, me["id"]):
                 continue
@@ -211,11 +166,29 @@ class Bot:
                 bonus += 18 * (me["cubes"]+3>=next_milestone)
             goals.append((focus, bonus, 0.7))
         held = me["weapons"][1]
+        # Offers are drawn at the threshold from abilities held at that
+        # instant. A short equipment detour can unlock an entire card family.
+        # Keep the detour local and finish the sequence before the circle moves.
+        setup_cubes = [obj["pos"] for obj,seen in cubes
+                       if obs["t"]-seen<4 and self.reachable_reward(p,obj["pos"])]
+        if not (next_milestone-me["cubes"] <= min(3,len(setup_cubes))
+                and me["cubes"] < 10 and zone["next_radius"]>=70
+                and (not held or held["kind"] not in ("laser","lightning"))):
+            setup_cubes=[]
+        setup_cubes.sort(key=lambda q:distance(p,q))
+        setup_cubes=setup_cubes[:6]
         if not held or obs["t"] >= self.next_swap:
             for obj, seen in self.items["pickups"].values():
                 value = self.item_values[obj["kind"]]
                 desired = value > (self.item_values[held["kind"]]+11 if held else 0)
                 if desired and self.reachable_reward(p, obj["pos"]):
+                    if setup_cubes and obj["kind"] in ("laser","lightning"):
+                        near_cube=setup_cubes[0]
+                        cost_to_item=distance(p,obj["pos"])
+                        route_cost=cost_to_item+min(distance(obj["pos"],q) for q in setup_cubes)
+                        extra=max(0,(route_cost-distance(p,near_cube))/speed)
+                        if cost_to_item < 5*speed and extra < 3.8 and travel_slack(obj["pos"])>5:
+                            value += 82-9*extra
                     if value >= 72:
                         resources.add(tuple(obj["pos"][:2]))
                     goals.append((obj["pos"], value - (obs["t"] - seen), 0))
