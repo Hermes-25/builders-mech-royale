@@ -62,8 +62,7 @@ class Bot:
         self.last_reverse = -10
         self.items = {"cubes": {}, "pickups": {}, "crates": {}}
         self.last_goal = None
-        self.item_values = {}
-        self.next_swap = 0
+        self.resource_targets = set()
         try:
             self.surface = RewardSurface(hello["map"]["dir"])
         except (OSError, KeyError, ValueError, EOFError):
@@ -90,22 +89,11 @@ class Bot:
             for obj in obs[group]:
                 memory[obj["id"]] = (obj, now)
 
-    def value_items(self, obs):
-        """Value the two arcade abilities using their class-matching bonuses."""
-        me=obs["self"]
-        rivals=[m for m in obs["mechs"] if m["kind"]=="mech"]
-        near=sum(distance(me["pos"],m["pos"]) <= self.config["weapons"]["lightning"]["range"] for m in rivals)
-        bonus=any("mortar" in m.get("weapons",()) for m in rivals)
-        self.item_values={"laser":88+12*bonus+5*(len(rivals)>near),
-                          "lightning":72+15*min(near,3),
-                          "mortar":34, "gun":-100}
-
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
         p, center = me["pos"], zone["next_center"]
         speed = max(1, me["stats"]["walk_speed"])
         self.remember(obs)
-        self.value_items(obs)
         time_left = max(0, zone["shrink_end"] - obs["t"])
         # Reserve walking time for the closing circle before seeking rewards.
         def travel_slack(target):
@@ -120,9 +108,28 @@ class Bot:
             a = angle + i * math.tau / 10
             pt = (center[0] + radius * math.cos(a), center[1] + radius * math.sin(a))
             goals.append((pt, 0, 0))
-        for obj, seen in self.items["cubes"].values():
+        resources = self.resource_targets
+        resources.clear()
+        cubes = list(self.items["cubes"].values())
+        cube_groups = {}
+        for c,_ in cubes:
+            q=c["pos"];key=(math.floor(q[0]/13),math.floor(q[1]/13))
+            cube_groups.setdefault(key,[]).append(q)
+        milestones = self.config["cubes"]["upgrade_thresholds"]
+        next_milestone = next((n for n in milestones if n>me["cubes"]),float("inf"))
+        for obj, seen in cubes:
             if self.reachable_reward(p, obj["pos"]):
                 bonus = (75 if me["cubes"] < 3 else 54) - (obs["t"] - seen) * 0.9
+                q=obj["pos"];i,j=math.floor(q[0]/13),math.floor(q[1]/13)
+                gain=0
+                for di,dj in ((0,0),(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)):
+                    for neighbor in cube_groups.get((i+di,j+dj),()):
+                        if abs(neighbor[2]-q[2])<4 and distance(neighbor,q)<13:
+                            gain+=1
+                            if gain==4:break
+                    if gain==4:break
+                bonus += (gain-1)*18 + 20*(me["cubes"]+gain>=next_milestone)
+                resources.add(tuple(obj["pos"][:2]))
                 goals.append((obj["pos"], bonus, 0))
         for obj in obs["drops"]:
             if obj["holder"] not in (None, me["id"]):
@@ -141,13 +148,18 @@ class Bot:
             else:
                 vx, vy = direction(obj["pos"], p)
                 focus = (obj["pos"][0] + vx * rad, obj["pos"][1] + vy * rad)
+            if obj["lands_in"] < arrival + 4:
+                resources.add(tuple(focus[:2]))
+                bonus += 18 * (me["cubes"]+3>=next_milestone)
             goals.append((focus, bonus, 0.7))
         held = me["weapons"][1]
-        if not held or obs["t"] >= self.next_swap:
+        if not held or held["kind"] != "lightning":
             for obj, seen in self.items["pickups"].values():
-                value = self.item_values[obj["kind"]]
-                desired = value > (self.item_values[held["kind"]]+11 if held else 0)
+                desired = obj["kind"] == "lightning" or (not held and obj["kind"] != "gun")
                 if desired and self.reachable_reward(p, obj["pos"]):
+                    value = 89 if obj["kind"] == "lightning" else 43
+                    if obj["kind"]=="lightning":
+                        resources.add(tuple(obj["pos"][:2]))
                     goals.append((obj["pos"], value - (obs["t"] - seen), 0))
         for obj, seen in self.items["crates"].values():
             if me["cubes"] < 6 and self.reachable_reward(p, obj["pos"]):
@@ -169,8 +181,16 @@ class Bot:
             boundary = distance(pt, zone["center"]) - zone["radius"] + 6
             exposure = sum(max(0, 72 - distance(pt, other)) for other in crowd)
             continuity = 8 if self.last_goal and distance(pt, self.last_goal) < 5 else 0
+            # A brief visit that earns a cube/upgrade need not commit the
+            # rest of the route to the crowded pickup zone.
+            threat_weight=0.68
+            if tuple(pt[:2]) in resources:
+                our_time=distance(p,pt)/speed
+                their_time=min((distance(q,pt)/speed for q in crowd),default=100)
+                if our_time<2.8 and our_time <= their_time+0.4:
+                    threat_weight=0.14 if me["hp"]>me["max_hp"]*.5 else 0.35
             return (reward + continuity - 0.46 * max(0, distance(p, pt) - stop)
-                    - 0.68 * exposure - 2 * max(0, boundary)
+                    - threat_weight * exposure - 2 * max(0, boundary)
                     - 12 * max(0, 2 - slack))
 
         # At the end of a phase the old travel-time estimate becomes zero
@@ -258,44 +278,29 @@ class Bot:
             if arc:
                 preference = ("lightning_efficiency", "lightning_range", "plating",
                               "lightning_chain", "armor", "nanites", "reactor") + preference
-            elif held and held["kind"] == "laser":
-                preference = ("laser_damage", "plating", "laser_charge", "laser_pierce", "armor", "nanites") + preference
             choices = obs["offer"]["choices"]
             action["pick"] = max(range(len(choices)), key=lambda i:
                 len(preference) - preference.index(choices[i]["id"]) if choices[i]["id"] in preference else 0)
-        if not held or now >= self.next_swap:
+        if not arc:
             nearby = [item for item in obs["pickups"] if
-                      self.item_values[item["kind"]] > (self.item_values[held["kind"]]+11 if held else 0)
+                      (item["kind"] == "lightning" or (not held and item["kind"] != "gun"))
                       and abs(item["pos"][2] - p[2]) < 4
                       and distance(p, item["pos"]) < self.config["loot"]["pickup_radius"]]
             if nearby and not (held and held.get("charge", 0) > 0):
-                action["take"] = max(nearby, key=lambda obj: self.item_values[obj["kind"]])["id"]
+                action["take"] = max(nearby, key=lambda obj: obj["kind"] == "lightning")["id"]
                 if held:
                     action["drop"] = 1
-                    self.next_swap = now + 4
 
         # Use the game's basic point-and-click interaction on visible sprites.
         primary = me["weapons"][0]
-        item_range = max(primary["stats"]["range"], held["stats"].get("range",0) if held else 0)
-        actors = [m for m in obs["mechs"] if distance(p, m["pos"]) < item_range]
-        rivals = [m for m in actors if m["kind"] == "mech"]
-        if rivals:
-            actors = rivals
+        actors = [m for m in obs["mechs"] if distance(p, m["pos"]) < primary["stats"]["range"]]
+        actors=[m for m in actors if m["kind"]=="mech" or distance(p,m["pos"])<55]
         if active_arc:
             scored = [m for m in actors if m["kind"] == "mech" and distance(p, m["pos"]) < held["stats"]["range"]]
             actors = scored or actors
         objects = actors or [c for c in obs["crates"] if distance(p, c["pos"]) < 80]
         if objects:
-            if held and held["kind"] == "laser" and rivals:
-                # One HP counter reaching zero earns a placement. Prefer a
-                # completed counter to spreading the same ability across many.
-                def pulses(obj):
-                    multiplier=1+held["stats"].get("cookoff",0)*("mortar" in obj.get("weapons",()))
-                    power=max(1,held["stats"]["damage"]*multiplier)
-                    return (math.ceil(obj["hp"]/power),obj["hp"]/power,distance(p,obj["pos"]))
-                target=min(objects,key=pulses)
-            else:
-                target = min(objects, key=lambda obj: distance(p, obj["pos"]) + 0.023 * obj["hp"])
+            target = min(objects, key=lambda obj: distance(p, obj["pos"]) + 0.023 * obj["hp"])
             q = target["pos"]
             height = {"mech": 4.5, "npc": 1.75}.get(target.get("kind"), 1.2)
             action["aim"] = [math.atan2(q[1] - p[1], q[0] - p[0]),
@@ -306,13 +311,7 @@ class Bot:
             if item:
                 kind = item["kind"]
                 if kind == "laser":
-                    stats=item["stats"]
-                    full=stats.get("charge",0.75)
-                    frac=stats.get("min_frac",0.35)
-                    power=stats["damage"]*(1+stats.get("cookoff",0)*("mortar" in target.get("weapons",())))
-                    needed=full*(target["hp"]/max(1,power)-frac)/max(.01,1-frac)
-                    threshold=max(stats.get("min_charge",0.15),min(full,needed+.025))
-                    secondary = item.get("charge", 0) < threshold
+                    secondary = item.get("charge", 0) < item["stats"].get("charge", 0.75)
                 elif kind == "lightning":
                     secondary = distance(p, q) <= item["stats"]["range"]
                 else:
