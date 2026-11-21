@@ -61,10 +61,12 @@ class Bot:
         self.obstruction = deque(maxlen=7)
         self.last_reverse = -10
         self.items = {"cubes": {}, "pickups": {}, "crates": {}}
+        self.reconsider_after = {}
+        self.collectible_at = {}
+        self.collection_trial = None
         self.last_goal = None
         self.resource_targets = set()
         self.item_values = {}
-        self.fast_inventory = False
         self.next_swap = 0
         self.sequence_at = -2
         self.sequence_key = None
@@ -91,13 +93,43 @@ class Bot:
     def remember(self, obs):
         """Remember static collectibles across short gaps in visibility."""
         p, now = obs["self"]["pos"], obs["t"]
+        self.collectible_at.clear()
         for group, memory in self.items.items():
             visible = {obj["id"] for obj in obs[group]}
             for key, (obj, seen) in list(memory.items()):
                 if key not in visible and (now - seen > 14 or distance(p, obj["pos"]) < 7):
                     del memory[key]
             for obj in obs[group]:
-                memory[obj["id"]] = (obj, now)
+                key=obj["id"]
+                if now>=self.reconsider_after.get(key,-1):
+                    memory[key] = (obj, now)
+            if group in ("cubes","pickups"):
+                for obj,_ in memory.values():
+                    self.collectible_at[tuple(obj["pos"][:2])]=(group,obj)
+
+    def observe_collection(self, obs, goal):
+        """Give up temporarily when the selected collectible stays out of reach."""
+        candidate=self.collectible_at.get(tuple(goal[:2]))
+        if not candidate:
+            self.collection_trial=None
+            return
+        group,obj=candidate
+        now=obs["t"];p=obs["self"]["pos"];q=obj["pos"]
+        radius=self.config["loot" if group=="pickups" else "cubes"]["pickup_radius"]
+        horizontal=distance(p,q)
+        vertical=max(0,abs(p[2]-q[2])-3.5)
+        remaining=max(0,horizontal-radius)+vertical
+        trial=self.collection_trial
+        if trial is None or trial[0]!=obj["id"] or remaining<trial[1]-1.25:
+            self.collection_trial=(obj["id"],remaining,now)
+            return
+        stalled=1.65 if horizontal<=radius+1.5 and vertical>1 else 3.4
+        if remaining>.7 and now-trial[2]>=stalled:
+            key=obj["id"]
+            self.reconsider_after[key]=now+(14 if vertical>1 else 7)
+            self.items[group].pop(key,None)
+            self.collection_trial=None
+            self.sequence_key=None
 
     def value_items(self, obs):
         """Value the two arcade abilities using their class-matching bonuses."""
@@ -115,12 +147,6 @@ class Bot:
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
         p, center = me["pos"], zone["next_center"]
-        points=16-obs["alive"]
-        if obs["t"]<24 and any(m["kind"]=="mech" and distance(p,m["pos"])<120 and
-                any(k in ("lightning","laser") for k in m.get("weapons",())) for m in obs["mechs"]):
-            self.fast_inventory=True
-        building=points<=2 and not self.fast_inventory and me["hp"]>.68*me["max_hp"] and me["cubes"]<6
-        established=points>=5 and me["cubes"]>=6
         speed = max(1, me["stats"]["walk_speed"])
         self.remember(obs)
         self.value_items(obs)
@@ -159,10 +185,6 @@ class Bot:
                             if gain==4:break
                     if gain==4:break
                 bonus += (gain-1)*18 + 20*(me["cubes"]+gain>=next_milestone)
-                if building and me["cubes"]<3:
-                    bonus+=15
-                elif established and me["cubes"]+gain<next_milestone:
-                    bonus-=17
                 resources.add(tuple(obj["pos"][:2]))
                 goals.append((obj["pos"], bonus, 0))
         for obj in obs["drops"]:
@@ -172,8 +194,6 @@ class Bot:
             wait = max(0, obj["lands_in"] - arrival)
             healing = 1 - me["hp"] / max(1, me["max_hp"])
             bonus = 84 + healing * 95 - min(100, wait * 4)
-            if established:
-                bonus+=22*healing
             if obj["holder"] == me["id"]:
                 bonus += 30 * obj["progress"]
             # Standing near the edge still captures. Pick a point reachable
@@ -196,8 +216,7 @@ class Bot:
                 if desired and self.reachable_reward(p, obj["pos"]):
                     if value >= 72:
                         resources.add(tuple(obj["pos"][:2]))
-                    development=24 if building and not held and value>=72 else 0
-                    goals.append((obj["pos"], value + development - (obs["t"] - seen), 0))
+                    goals.append((obj["pos"], value - (obs["t"] - seen), 0))
         for obj, seen in self.items["crates"].values():
             if me["cubes"] < 6 and self.reachable_reward(p, obj["pos"]):
                 goals.append((obj["pos"], 36 - (obs["t"] - seen), 6))
@@ -224,8 +243,7 @@ class Bot:
             if tuple(pt[:2]) in resources:
                 our_time=distance(p,pt)/speed
                 their_time=min((distance(q,pt)/speed for q in crowd),default=100)
-                limit=4.4 if building else 2.8
-                if our_time<limit and our_time <= their_time+0.4:
+                if our_time<2.8 and our_time <= their_time+0.4:
                     threat_weight=0.14 if me["hp"]>me["max_hp"]*.5 else 0.35
             return (reward + continuity - 0.46 * max(0, distance(p, pt) - stop)
                     - threat_weight * exposure - 2 * max(0, boundary)
@@ -387,11 +405,7 @@ class Bot:
         p, now = me["pos"], obs["t"]
         goal, stop = self.destination(obs)
         goal, stop = self.resource_sequence(obs,goal,stop)
-        points=16-obs["alive"]
-        missing_item=not me["weapons"][1] or me["weapons"][1]["kind"]=="mortar"
-        develop_longer=points<=2 and not self.fast_inventory
-        developing=missing_item or (develop_longer and me["cubes"]==0)
-        if now < (140 if develop_longer else 100) and developing:
+        if now < 100 and (not me["weapons"][1] or me["weapons"][1]["kind"]=="mortar"):
             cell = 28
             if now-self.scan_tick >= .65:
                 self.scan_tick = now
@@ -405,7 +419,7 @@ class Bot:
                         if radius<35 or (radius<116 and dx*ux+dy*uy>.6*radius):
                             self.discovered_tiles.add((i,j))
             waiting = any(distance(goal,point)<8 for point in self.resource_targets)
-            known = missing_item and any(it["kind"] in ("laser","lightning") and now-seen<9 and
+            known = any(it["kind"] in ("laser","lightning") and now-seen<9 and
                         distance(p,it["pos"])<125 and self.reachable_reward(p,it["pos"])
                         for it,seen in self.items["pickups"].values())
             near_box = me["cubes"] < 6 and any(
@@ -451,6 +465,7 @@ class Bot:
                     self.explore_at=now
                 if self.explore_goal is not None:
                     goal,stop=self.explore_goal,0
+        self.observe_collection(obs,goal)
         resting = distance(p, goal) <= max(0.6, stop)
         dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
         if me["energy"] < 0.24 * me["max_energy"]:
