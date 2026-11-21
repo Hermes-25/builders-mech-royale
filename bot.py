@@ -64,6 +64,7 @@ class Bot:
         self.last_goal = None
         self.resource_targets = set()
         self.item_values = {}
+        self.fast_inventory = False
         self.next_swap = 0
         self.sequence_at = -2
         self.sequence_key = None
@@ -114,6 +115,12 @@ class Bot:
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
         p, center = me["pos"], zone["next_center"]
+        points=16-obs["alive"]
+        if obs["t"]<24 and any(m["kind"]=="mech" and distance(p,m["pos"])<120 and
+                any(k in ("lightning","laser") for k in m.get("weapons",())) for m in obs["mechs"]):
+            self.fast_inventory=True
+        building=points<=2 and not self.fast_inventory and me["hp"]>.68*me["max_hp"] and me["cubes"]<6
+        established=points>=5 and me["cubes"]>=6
         speed = max(1, me["stats"]["walk_speed"])
         self.remember(obs)
         self.value_items(obs)
@@ -152,6 +159,10 @@ class Bot:
                             if gain==4:break
                     if gain==4:break
                 bonus += (gain-1)*18 + 20*(me["cubes"]+gain>=next_milestone)
+                if building and me["cubes"]<3:
+                    bonus+=15
+                elif established and me["cubes"]+gain<next_milestone:
+                    bonus-=17
                 resources.add(tuple(obj["pos"][:2]))
                 goals.append((obj["pos"], bonus, 0))
         for obj in obs["drops"]:
@@ -161,6 +172,8 @@ class Bot:
             wait = max(0, obj["lands_in"] - arrival)
             healing = 1 - me["hp"] / max(1, me["max_hp"])
             bonus = 84 + healing * 95 - min(100, wait * 4)
+            if established:
+                bonus+=22*healing
             if obj["holder"] == me["id"]:
                 bonus += 30 * obj["progress"]
             # Standing near the edge still captures. Pick a point reachable
@@ -183,7 +196,8 @@ class Bot:
                 if desired and self.reachable_reward(p, obj["pos"]):
                     if value >= 72:
                         resources.add(tuple(obj["pos"][:2]))
-                    goals.append((obj["pos"], value - (obs["t"] - seen), 0))
+                    development=24 if building and not held and value>=72 else 0
+                    goals.append((obj["pos"], value + development - (obs["t"] - seen), 0))
         for obj, seen in self.items["crates"].values():
             if me["cubes"] < 6 and self.reachable_reward(p, obj["pos"]):
                 goals.append((obj["pos"], 36 - (obs["t"] - seen), 6))
@@ -210,7 +224,8 @@ class Bot:
             if tuple(pt[:2]) in resources:
                 our_time=distance(p,pt)/speed
                 their_time=min((distance(q,pt)/speed for q in crowd),default=100)
-                if our_time<2.8 and our_time <= their_time+0.4:
+                limit=4.4 if building else 2.8
+                if our_time<limit and our_time <= their_time+0.4:
                     threat_weight=0.14 if me["hp"]>me["max_hp"]*.5 else 0.35
             return (reward + continuity - 0.46 * max(0, distance(p, pt) - stop)
                     - threat_weight * exposure - 2 * max(0, boundary)
@@ -372,11 +387,11 @@ class Bot:
         p, now = me["pos"], obs["t"]
         goal, stop = self.destination(obs)
         goal, stop = self.resource_sequence(obs,goal,stop)
-        slot = me["weapons"][1]
-        missing_gear = not slot or slot["kind"] == "mortar"
-        seeking_core = bool(slot and slot["kind"] in ("laser","lightning") and
-                            me["cubes"] < 1 and now < 60)
-        if (now < 100 and missing_gear) or seeking_core:
+        points=16-obs["alive"]
+        missing_item=not me["weapons"][1] or me["weapons"][1]["kind"]=="mortar"
+        develop_longer=points<=2 and not self.fast_inventory
+        developing=missing_item or (develop_longer and me["cubes"]==0)
+        if now < (140 if develop_longer else 100) and developing:
             cell = 28
             if now-self.scan_tick >= .65:
                 self.scan_tick = now
@@ -390,15 +405,11 @@ class Bot:
                         if radius<35 or (radius<116 and dx*ux+dy*uy>.6*radius):
                             self.discovered_tiles.add((i,j))
             waiting = any(distance(goal,point)<8 for point in self.resource_targets)
-            known = any(it["kind"] in ("laser","lightning") and now-seen<9 and
+            known = missing_item and any(it["kind"] in ("laser","lightning") and now-seen<9 and
                         distance(p,it["pos"])<125 and self.reachable_reward(p,it["pos"])
                         for it,seen in self.items["pickups"].values())
-            if seeking_core:
-                # Once equipped, an unexplored area is valuable for finding
-                # the first core cube and the corresponding upgrade draw.
-                known = any(now-seen<7 and distance(p,cube["pos"])<100 and
-                            self.reachable_reward(p,cube["pos"]) for cube,seen in self.items["cubes"].values())
-            near_box = any(distance(p,c["pos"])<44 for c in obs["crates"])
+            near_box = me["cubes"] < 6 and any(
+                distance(p,c["pos"]) < 24 and self.reachable_reward(p,c["pos"]) for c in obs["crates"])
             z=obs["zone"]
             if (not (known or waiting or near_box) and me["in_zone"] and
                     me["hp"]>.52*me["max_hp"] and distance(p,z["center"])<z["radius"]-28):
