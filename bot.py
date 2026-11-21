@@ -49,9 +49,6 @@ class RewardSurface:
 
 class Bot:
     name = "Afterglow"
-    early_gear_value = 1.48
-    early_cube_value = 1.2
-    nearby_crate_distance = 18
 
     def __init__(self, hello):
         self.config = hello["config"]
@@ -117,6 +114,9 @@ class Bot:
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
         p, center = me["pos"], zone["next_center"]
+        points=16-obs["alive"]
+        building=points<=2 and me["hp"]>.68*me["max_hp"] and me["cubes"]<6
+        established=points>=5 and me["cubes"]>=6
         speed = max(1, me["stats"]["walk_speed"])
         self.remember(obs)
         self.value_items(obs)
@@ -155,8 +155,10 @@ class Bot:
                             if gain==4:break
                     if gain==4:break
                 bonus += (gain-1)*18 + 20*(me["cubes"]+gain>=next_milestone)
-                if obs["t"] < 70 and me["cubes"] < 6:
-                    bonus *= self.early_cube_value
+                if building and me["cubes"]<3:
+                    bonus+=15
+                elif established and me["cubes"]+gain<next_milestone:
+                    bonus-=17
                 resources.add(tuple(obj["pos"][:2]))
                 goals.append((obj["pos"], bonus, 0))
         for obj in obs["drops"]:
@@ -166,6 +168,8 @@ class Bot:
             wait = max(0, obj["lands_in"] - arrival)
             healing = 1 - me["hp"] / max(1, me["max_hp"])
             bonus = 84 + healing * 95 - min(100, wait * 4)
+            if established:
+                bonus+=22*healing
             if obj["holder"] == me["id"]:
                 bonus += 30 * obj["progress"]
             # Standing near the edge still captures. Pick a point reachable
@@ -188,10 +192,8 @@ class Bot:
                 if desired and self.reachable_reward(p, obj["pos"]):
                     if value >= 72:
                         resources.add(tuple(obj["pos"][:2]))
-                    priority=value
-                    if obs["t"]<70 and (not held or held["kind"]=="mortar") and value>=72:
-                        priority *= self.early_gear_value
-                    goals.append((obj["pos"], priority - (obs["t"] - seen), 0))
+                    development=24 if building and not held and value>=72 else 0
+                    goals.append((obj["pos"], value + development - (obs["t"] - seen), 0))
         for obj, seen in self.items["crates"].values():
             if me["cubes"] < 6 and self.reachable_reward(p, obj["pos"]):
                 goals.append((obj["pos"], 36 - (obs["t"] - seen), 6))
@@ -218,7 +220,8 @@ class Bot:
             if tuple(pt[:2]) in resources:
                 our_time=distance(p,pt)/speed
                 their_time=min((distance(q,pt)/speed for q in crowd),default=100)
-                if our_time<2.8 and our_time <= their_time+0.4:
+                limit=4.4 if building else 2.8
+                if our_time<limit and our_time <= their_time+0.4:
                     threat_weight=0.14 if me["hp"]>me["max_hp"]*.5 else 0.35
             return (reward + continuity - 0.46 * max(0, distance(p, pt) - stop)
                     - threat_weight * exposure - 2 * max(0, boundary)
@@ -380,7 +383,10 @@ class Bot:
         p, now = me["pos"], obs["t"]
         goal, stop = self.destination(obs)
         goal, stop = self.resource_sequence(obs,goal,stop)
-        if now < 100 and (not me["weapons"][1] or me["weapons"][1]["kind"]=="mortar"):
+        points=16-obs["alive"]
+        missing_item=not me["weapons"][1] or me["weapons"][1]["kind"]=="mortar"
+        developing=missing_item or (points<=2 and me["cubes"]==0)
+        if now < (140 if points<=2 else 100) and developing:
             cell = 28
             if now-self.scan_tick >= .65:
                 self.scan_tick = now
@@ -394,11 +400,11 @@ class Bot:
                         if radius<35 or (radius<116 and dx*ux+dy*uy>.6*radius):
                             self.discovered_tiles.add((i,j))
             waiting = any(distance(goal,point)<8 for point in self.resource_targets)
-            known = any(it["kind"] in ("laser","lightning") and now-seen<9 and
+            known = missing_item and any(it["kind"] in ("laser","lightning") and now-seen<9 and
                         distance(p,it["pos"])<125 and self.reachable_reward(p,it["pos"])
                         for it,seen in self.items["pickups"].values())
-            near_box = me["cubes"]<6 and any(distance(p,c["pos"]) < self.nearby_crate_distance
-                and self.reachable_reward(p,c["pos"]) for c in obs["crates"])
+            near_box = me["cubes"] < 6 and any(
+                distance(p,c["pos"]) < 24 and self.reachable_reward(p,c["pos"]) for c in obs["crates"])
             z=obs["zone"]
             if (not (known or waiting or near_box) and me["in_zone"] and
                     me["hp"]>.52*me["max_hp"] and distance(p,z["center"])<z["radius"]-28):
