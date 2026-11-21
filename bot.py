@@ -68,9 +68,6 @@ class Bot:
         self.sequence_at = -2
         self.sequence_key = None
         self.sequence_first = None
-        self.card_activity=deque()
-        self.last_card_tick=0
-        self.last_health_cost=-50
         self.discovered_tiles = set()
         self.scan_tick = -2
         self.explore_goal = None
@@ -404,11 +401,29 @@ class Bot:
                         pt=(p[0]+55*dx,p[1]+55*dy)
                         if distance(pt,z["center"])>z["radius"]-14:continue
                         gain=0
+                        first_tiles=set()
                         for depth in (45,75,105):
                             for side in (-35,0,35):
                                 k=(math.floor((p[0]+depth*dx-side*dy)/cell),
                                    math.floor((p[1]+depth*dy+side*dx)/cell))
+                                first_tiles.add(k)
                                 gain+=k not in self.discovered_tiles
+                        # Compare the follow-up discovery opportunities before
+                        # committing to this first leg of the opening search.
+                        future=0
+                        for turn in (-math.pi/4,0,math.pi/4):
+                            vx,vy=math.cos(a+turn),math.sin(a+turn)
+                            end=(pt[0]+72*vx,pt[1]+72*vy)
+                            if distance(end,z["center"])>z["radius"]-18:continue
+                            fresh=set()
+                            for reach in (60,96,128):
+                                for offset in (-33,0,33):
+                                    tile=(math.floor((pt[0]+reach*vx-offset*vy)/cell),
+                                          math.floor((pt[1]+reach*vy+offset*vx)/cell))
+                                    if tile not in self.discovered_tiles and tile not in first_tiles:
+                                        fresh.add(tile)
+                            future=max(future,len(fresh))
+                        gain+=.55*future
                         continuity=0 if self.explore_goal is None else 1-.012*distance(pt,self.explore_goal)
                         cost=max(0,distance(pt,z["next_center"])-z["next_radius"])*.015
                         options.append((gain+continuity-cost-.004*distance(pt,goal),pt))
@@ -416,18 +431,6 @@ class Bot:
                     self.explore_at=now
                 if self.explore_goal is not None:
                     goal,stop=self.explore_goal,0
-        dt=min(.3,max(0,now-self.last_card_tick))
-        self.last_card_tick=now
-        for event in obs["events"]:
-            if event["type"]=="damaged":
-                self.last_health_cost=now
-                self.card_activity.append((now,"lost",event["amount"]))
-            elif event["type"]=="hit" and event.get("target",1000)<100:
-                self.card_activity.append((now,event["weapon"],event["amount"]))
-        if me["hp"]<.95*me["max_hp"] and now-self.last_health_cost>=me["stats"]["regen_delay"]-1.5:
-            self.card_activity.append((now,"regen",dt))
-        while self.card_activity and self.card_activity[0][0]<now-32:
-            self.card_activity.popleft()
         resting = distance(p, goal) <= max(0.6, stop)
         dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
         if me["energy"] < 0.24 * me["max_energy"]:
@@ -453,26 +456,6 @@ class Bot:
             choices = obs["offer"]["choices"]
             action["pick"] = max(range(len(choices)), key=lambda i:
                 len(preference) - preference.index(choices[i]["id"]) if choices[i]["id"] in preference else 0)
-            activity={}
-            for _,kind,amount in self.card_activity:
-                activity[kind]=activity.get(kind,0)+amount
-            # Use a small prior at spawn then buy the card with the greatest
-            # expected change to the avatar's recently used game meters.
-            base_hp=self.config["mech"]["hp"]
-            gun_points=650+activity.get("gun",0)*.8
-            laser_points=650+activity.get("laser",0)*.8
-            arc_points=650+activity.get("lightning",0)*.8
-            hp_ratio=me["hp"]/me["max_hp"]
-            benefits={
-                "plating":base_hp*.15*(1.2-.30*hp_ratio),
-                "armor":(900+activity.get("lost",0))*.08/max(.55,1-me["stats"].get("armor",0)),
-                "nanites":65+min(220,activity.get("regen",0)*19),
-                "gun_damage":.15*gun_points,"gun_rate":.105*gun_points,"gun_mag":.23*gun_points,
-                "laser_damage":.18*laser_points,"laser_charge":.085*laser_points,
-                "laser_pierce":.035*laser_points,"lightning_efficiency":.20*arc_points,
-                "lightning_range":.18*arc_points,"lightning_chain":.08*arc_points,
-                "servos":100,"reactor":50,"jets":43,"capacitor":44,"sensors":55}
-            action["pick"]=max(range(len(choices)),key=lambda i:benefits.get(choices[i]["id"],25))
         if not held or now >= self.next_swap:
             nearby = [item for item in obs["pickups"] if
                       self.item_values[item["kind"]] > (self.item_values[held["kind"]]+11 if held else 0)
