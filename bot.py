@@ -65,6 +65,7 @@ class Bot:
         self.resource_targets = set()
         self.item_values = {}
         self.next_swap = 0
+        self.unlock_crate = None
         try:
             self.surface = RewardSurface(hello["map"]["dir"])
         except (OSError, KeyError, ValueError, EOFError):
@@ -101,6 +102,21 @@ class Bot:
                           "lightning":72+15*min(near,3),
                           "mortar":34, "gun":-100}
 
+    def crate_opportunity(self, obs, milestone):
+        """Finish one nearby loot box when its cube immediately unlocks an offer."""
+        me=obs["self"];p=me["pos"]
+        if (milestone-me["cubes"]!=1 or obs["t"]>180 or me["hp"]<0.58*me["max_hp"]
+                or not me["in_zone"] or obs["zone"]["next_radius"]<70):
+            return None
+        if any(distance(p,c["pos"])<22 for c in obs["cubes"]):
+            return None
+        rivals=[m for m in obs["mechs"] if m["kind"]=="mech"]
+        if any(distance(p,m["pos"])<65 or m["hp"]<280 for m in rivals):
+            return None
+        possible=[c for c in obs["crates"] if distance(p,c["pos"])<=23
+                  and abs(c["pos"][2]-p[2])<5]
+        return min(possible,key=lambda c: distance(p,c["pos"])+c["hp"]*.027,default=None)
+
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
         p, center = me["pos"], zone["next_center"]
@@ -130,6 +146,7 @@ class Bot:
             cube_groups.setdefault(key,[]).append(q)
         milestones = self.config["cubes"]["upgrade_thresholds"]
         next_milestone = next((n for n in milestones if n>me["cubes"]),float("inf"))
+        self.unlock_crate = self.crate_opportunity(obs,next_milestone)
         for obj, seen in cubes:
             if self.reachable_reward(p, obj["pos"]):
                 bonus = (75 if me["cubes"] < 3 else 54) - (obs["t"] - seen) * 0.9
@@ -166,35 +183,18 @@ class Bot:
                 bonus += 18 * (me["cubes"]+3>=next_milestone)
             goals.append((focus, bonus, 0.7))
         held = me["weapons"][1]
-        # Offers are drawn at the threshold from abilities held at that
-        # instant. A short equipment detour can unlock an entire card family.
-        # Keep the detour local and finish the sequence before the circle moves.
-        setup_cubes = [obj["pos"] for obj,seen in cubes
-                       if obs["t"]-seen<4 and self.reachable_reward(p,obj["pos"])]
-        if not (next_milestone-me["cubes"] <= min(3,len(setup_cubes))
-                and me["cubes"] < 10 and zone["next_radius"]>=70
-                and (not held or held["kind"] not in ("laser","lightning"))):
-            setup_cubes=[]
-        setup_cubes.sort(key=lambda q:distance(p,q))
-        setup_cubes=setup_cubes[:6]
         if not held or obs["t"] >= self.next_swap:
             for obj, seen in self.items["pickups"].values():
                 value = self.item_values[obj["kind"]]
                 desired = value > (self.item_values[held["kind"]]+11 if held else 0)
                 if desired and self.reachable_reward(p, obj["pos"]):
-                    if setup_cubes and obj["kind"] in ("laser","lightning"):
-                        near_cube=setup_cubes[0]
-                        cost_to_item=distance(p,obj["pos"])
-                        route_cost=cost_to_item+min(distance(obj["pos"],q) for q in setup_cubes)
-                        extra=max(0,(route_cost-distance(p,near_cube))/speed)
-                        if cost_to_item < 5*speed and extra < 3.8 and travel_slack(obj["pos"])>5:
-                            value += 82-9*extra
                     if value >= 72:
                         resources.add(tuple(obj["pos"][:2]))
                     goals.append((obj["pos"], value - (obs["t"] - seen), 0))
         for obj, seen in self.items["crates"].values():
             if me["cubes"] < 6 and self.reachable_reward(p, obj["pos"]):
-                goals.append((obj["pos"], 36 - (obs["t"] - seen), 6))
+                unlock=76 if self.unlock_crate and obj["id"]==self.unlock_crate["id"] else 0
+                goals.append((obj["pos"], 36+unlock-(obs["t"]-seen), 5 if unlock else 6))
 
         # Pick local waypoints when the next circle is far away. They adapt to
         # the current avatar density while preserving time to reach that circle.
@@ -335,7 +335,8 @@ class Bot:
         if active_arc:
             scored = [m for m in actors if m["kind"] == "mech" and distance(p, m["pos"]) < held["stats"]["range"]]
             actors = scored or actors
-        objects = actors or [c for c in obs["crates"] if distance(p, c["pos"]) < 80]
+        objects = ([self.unlock_crate] if self.unlock_crate else actors) or [
+            c for c in obs["crates"] if distance(p, c["pos"]) < 80]
         if objects:
             if held and held["kind"] == "laser" and rivals:
                 # One HP counter reaching zero earns a placement. Prefer a
