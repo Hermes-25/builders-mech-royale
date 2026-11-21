@@ -68,6 +68,10 @@ class Bot:
         self.sequence_at = -2
         self.sequence_key = None
         self.sequence_first = None
+        self.air_pickup = None
+        self.air_deadline = -1
+        self.air_retry = {}
+        self.air_seen = -1
         try:
             self.surface = RewardSurface(hello["map"]["dir"])
         except (OSError, KeyError, ValueError, EOFError):
@@ -173,7 +177,18 @@ class Bot:
             for obj, seen in self.items["pickups"].values():
                 value = self.item_values[obj["kind"]]
                 desired = value > (self.item_values[held["kind"]]+11 if held else 0)
-                if desired and self.reachable_reward(p, obj["pos"]):
+                point=obj["pos"]
+                regular=self.reachable_reward(p,point)
+                elevated=False
+                if (desired and not regular and obj["kind"] in ("laser","lightning")
+                        and obs["t"]-seen<5 and distance(p,point)<125
+                        and self.air_retry.get(obj["id"],-1)<obs["t"]):
+                    rise=point[2]-p[2]
+                    fuel=(rise/max(1,me["stats"]["max_rise_speed"])+.6)*me["stats"]["jet_drain"]
+                    elevated=(rise>4.5 and 15+fuel<me["energy"] and me["in_zone"]
+                              and (not self.surface or self.surface.above_tile(point)>4.5))
+                    if elevated:value-=min(28,8+0.45*rise)
+                if desired and (regular or elevated):
                     if value >= 72:
                         resources.add(tuple(obj["pos"][:2]))
                     goals.append((obj["pos"], value - (obs["t"] - seen), 0))
@@ -269,6 +284,64 @@ class Bot:
             dy = 0.42 * normal[1] + 0.90 * tangent[1]
         self.last_step = (tuple(p[:2]), (dx, dy), now)
         return dx, dy, self.contact is not None
+
+    def platform_pickup(self, obs, action):
+        """Spend jet energy only for a visible collectible above the avatar."""
+        me=obs["self"];now=obs["t"];p=me["pos"];zone=obs["zone"];stats=me["stats"]
+        if (not me["in_zone"] or me["hp"]<me["max_hp"]*.52
+                or zone["radius"]-distance(p,zone["center"])<8):
+            self.air_pickup=None
+            return
+        held=me["weapons"][1]
+        held_value=self.item_values.get(held["kind"],0) if held else 0
+        candidates=[(q,self.item_values[q["kind"]]) for q in obs["pickups"]
+                    if q["kind"] in ("laser","lightning") and self.item_values[q["kind"]]>held_value+11]
+        if me["cubes"]+1 in self.config["cubes"]["upgrade_thresholds"]:
+            candidates += [(q,67) for q in obs["cubes"]]
+        by_id={q["id"]:q for q,_ in candidates}
+        if self.air_pickup:
+            target_id,pt=self.air_pickup
+            if now>self.air_deadline or me["energy"]<9:
+                self.air_retry[target_id]=now+6
+                self.air_pickup=None
+            elif target_id not in by_id and (now-self.air_seen>.9 or
+                    any(e["type"] in ("took","pickup") for e in obs["events"])):
+                self.air_pickup=None
+            elif abs(pt[2]-p[2])<3.5 and distance(pt,p)<3.5:
+                self.air_pickup=None
+                return
+            elif target_id in by_id:
+                self.air_seen=now
+        if not self.air_pickup:
+            if not me["grounded"]:return
+            ground_option=any(abs(q["pos"][2]-p[2])<4 and distance(p,q["pos"])<22 and value>=70
+                              for q,value in candidates)
+            if ground_option:return
+            options=[]
+            for q,value in candidates:
+                pt=q["pos"];rise=pt[2]-p[2];travel=distance(p,pt)
+                if not (4.5<rise and travel<42) or self.air_retry.get(q["id"],-1)>now:continue
+                if self.surface and self.surface.above_tile(pt)<4.5:continue
+                flight=max(rise/max(1,stats["max_rise_speed"]),min(travel,21)/max(1,stats["walk_speed"]))
+                # Add a launch margin and retain enough energy for landing.
+                if (flight+.45)*stats["jet_drain"]+15>me["energy"]:continue
+                if distance(pt,zone["center"])>zone["radius"]-6:continue
+                options.append((value-.55*travel-.80*rise,q["id"],pt,flight,travel))
+            if not options:return
+            _,target_id,pt,flight,travel=max(options)
+            self.air_pickup=(target_id,pt)
+            self.air_seen=now
+            self.air_deadline=now+travel/max(1,stats["walk_speed"])+flight+2
+        _,pt=self.air_pickup
+        gap=distance(p,pt)
+        action["move"]=list(direction(p,pt)) if gap>1.8 else [0,0]
+        rise=pt[2]-p[2]
+        launch_radius=min(30,max(12,rise*1.2+8))
+        if me["grounded"] and gap>launch_radius:
+            action.update(jump=False,boost=False)
+        else:
+            action["jump"]=bool(me["grounded"] and rise>3.6)
+            action["boost"]=bool(not me["grounded"] and rise>2 and me["energy"]>9)
 
     def resource_sequence(self, obs, original, stop):
         """Look three rewards ahead before changing the next pickup.
@@ -448,6 +521,7 @@ class Bot:
         else:
             action["aim"] = [math.atan2(dy, dx) + 0.9 * math.sin(now * 0.7), 0]
             action["reload"] = primary.get("ammo", 0) < primary["stats"].get("mag", 0) * 0.7
+        self.platform_pickup(obs,action)
         return action
 
 
