@@ -66,7 +66,7 @@ class Bot:
         self.collection_trial = None
         self.last_goal = None
         self.resource_targets = set()
-        self.meter_plan="reward"
+        self.meter_plan="chain"
         self.urgent_until=-5.
         self.last_meter_hp=None
         self.item_values = {}
@@ -422,7 +422,7 @@ class Bot:
             # in which current movement has higher value than future travel.
             action["boost"]=True
             return
-        if self.meter_plan not in ("reward","both"):return
+        if self.meter_plan not in ("reward","both","chain"):return
         d=distance(p,goal)
         for supply in obs["drops"]:
             if supply["holder"] not in (None,me["id"]):continue
@@ -437,7 +437,12 @@ class Bot:
             return
         if tuple(goal[:2]) not in self.resource_targets:return
         drain=max(1.,st["boost_drain"])
-        target_time=d/fast
+        # Finish two observed collectible legs on the same charge. A
+        # lone opportunity still follows the incumbent's meter cycle.
+        next_leg=min((distance(goal,other) for other in self.resource_targets
+                      if 3<distance(goal,other)<34),default=None)
+        if next_leg is None:return
+        target_time=(d+next_leg)/fast
         reserve=24. if powered else 8.
         if d>5. and target_time<max(0.,energy-reserve)/drain:
             action["boost"]=True
