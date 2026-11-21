@@ -9,7 +9,6 @@ from pathlib import Path
 # Also supports Python's isolated embedded distribution.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mechfight
-from reward_paths import TileRoutes
 
 
 def distance(a, b):
@@ -83,15 +82,6 @@ class Bot:
             self.surface = RewardSurface(hello["map"]["dir"])
         except (OSError, KeyError, ValueError, EOFError):
             self.surface = None
-        self.price_item_detours=True
-        self.use_item_detour=True
-        self.item_detour_costs={}
-        self.path_queries_remaining=0
-        self.routes=None
-        if self.surface is not None:
-            world=json.loads((Path(hello["map"]["dir"])/"v2"/"world.json").read_bytes())
-            self.routes=TileRoutes(world["bounds"],world["prisms"],
-                lambda x,y:-self.surface.above_tile((x,y,0)),self.config["mech"])
 
     def reachable_reward(self, p, reward):
         if abs(reward[2] - p[2]) < 8:
@@ -144,53 +134,6 @@ class Bot:
             self.collection_trial=None
             self.sequence_key=None
 
-
-    def item_detour(self, obs, chosen, stop):
-        if self.routes is None or not self.use_item_detour:
-            return chosen,stop
-        p,now=obs["self"]["pos"],obs["t"]
-        key=tuple(chosen[:2])
-        trial=self.collection_trial
-        item=self.collectible_at.get(key)
-        if (not trial or not item or trial[0]!=item[1]["id"] or
-                now-trial[2]<1.1 or distance(p,chosen)>85 or distance(p,chosen)<6):
-            return chosen,stop
-        # Apply a waypoint only to this particular collectible, only after
-        # observed lack of collection progress and a confirmed obstructed path.
-        if self.routes.open_segment(p,chosen):
-            return chosen,stop
-        walk=self.routes.waypoint(p,chosen,now)
-        if distance(walk,p)<1.4 or distance(walk,chosen)<2:
-            return chosen,stop
-        return walk,.6
-
-    def excess_item_distance(self, p, target):
-        if self.routes is None or not self.price_item_detours or distance(p,target)>100:
-            return 0.
-        a,b=self.routes.cell(p),self.routes.cell(target)
-        cached=self.item_detour_costs.get((a,b))
-        if cached is not None:return cached
-        if self.routes.open_segment(p,target):
-            self.item_detour_costs[a,b]=0.
-            return 0.
-        # At most one graph query can be initiated per decision. Other
-        # obstructed candidates use a small provisional detour estimate.
-        if self.path_queries_remaining==0:return 9.
-        self.path_queries_remaining=0
-        origin,end=self.routes.nearest(a),self.routes.nearest(b)
-        if origin is None or end is None:return 12.
-        route=self.routes.search(origin,end)
-        if not route or route[-1]!=end:return 12.
-        last=p;length=0.
-        for cell in route:
-            current=self.routes.point(cell)
-            length+=distance(last,current)
-            last=current
-        value=min(75.,max(0.,length+distance(last,target)-distance(p,target)))
-        if len(self.item_detour_costs)>2048:self.item_detour_costs.clear()
-        self.item_detour_costs[a,b]=value
-        return value
-
     def value_items(self, obs):
         """Value the two arcade abilities using their class-matching bonuses."""
         me=obs["self"]
@@ -208,7 +151,6 @@ class Bot:
         me, zone = obs["self"], obs["zone"]
         p, center = me["pos"], zone["next_center"]
         speed = max(1, me["stats"]["walk_speed"])
-        self.path_queries_remaining=1
         self.remember(obs)
         self.value_items(obs)
         time_left = max(0, zone["shrink_end"] - obs["t"])
@@ -306,8 +248,6 @@ class Bot:
                 their_time=min((distance(q,pt)/speed for q in crowd),default=100)
                 if our_time<2.8 and our_time <= their_time+0.4:
                     threat_weight=0.14 if me["hp"]>me["max_hp"]*.5 else 0.35
-            if tuple(pt[:2]) in self.collectible_at:
-                reward -= 1.1*self.excess_item_distance(p,pt)
             return (reward + continuity - 0.46 * max(0, distance(p, pt) - stop)
                     - threat_weight * exposure - 2 * max(0, boundary)
                     - 12 * max(0, 2 - slack))
@@ -463,6 +403,7 @@ class Bot:
             return n[1],2 if n[0]=="drop" else 0
         return original,stop
 
+
     def allocate_energy(self, obs, goal, resting, blocked, action):
         me,now=obs["self"],obs["t"]
         hp,energy=me["hp"],me["energy"]
@@ -567,7 +508,6 @@ class Bot:
                 if self.explore_goal is not None:
                     goal,stop=self.explore_goal,0
         self.observe_collection(obs,goal)
-        goal,stop=self.item_detour(obs,goal,stop)
         resting = distance(p, goal) <= max(0.6, stop)
         dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
         if me["energy"] < 0.24 * me["max_energy"]:
