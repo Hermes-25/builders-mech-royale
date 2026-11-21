@@ -64,6 +64,8 @@ class Bot:
         self.last_goal = None
         self.recover_until = -1
         self.last_health = None
+        self.drop_progress = {}
+        self.drop_cooldown = {}
         self.mobility_heading = (0, 0)
         self.headings = tuple((math.cos(a * math.tau / 16), math.sin(a * math.tau / 16)) for a in range(16))
         try:
@@ -98,7 +100,8 @@ class Bot:
         close = min((distance(p, q) for q in crowd), default=200)
         if not crowd or (close > 110 and now >= self.recover_until):
             return destination, stop
-        if any(d["holder"] == me["id"] and d["progress"] >= 1.4 for d in obs["drops"]):
+        if any(d["holder"] == me["id"] and d["progress"] >= 1.4
+               and self.drop_cooldown.get(d["id"], -1) < now for d in obs["drops"]):
             return destination, stop
         duration = max(0.1, zone["shrink_end"] - max(now, zone["shrink_start"]))
         step = min(39, max(5, zone["radius"] * 0.32))
@@ -143,11 +146,29 @@ class Bot:
             for obj in obs[group]:
                 memory[obj["id"]] = (obj, now)
 
+    def contested_drops(self, obs):
+        """Stop paying the time cost of a capture when its game clock freezes."""
+        now, me = obs["t"], obs["self"]
+        for obj in obs["drops"]:
+            key = obj["id"]
+            progress, since = self.drop_progress.get(key, (-1, now))
+            clock = obj["progress"]
+            if obj["holder"] != me["id"] or obj["lands_in"] > 0:
+                self.drop_progress[key] = (clock, now)
+            elif clock > progress + 0.015 or clock < progress - 0.015:
+                self.drop_progress[key] = (clock, now)
+                self.drop_cooldown.pop(key, None)
+            elif now - since > 1.3 and any(
+                    m["kind"] == "mech" and distance(m["pos"], obj["pos"]) <= obj["radius"] + 2
+                    for m in obs["mechs"]):
+                self.drop_cooldown[key] = now + 4.5
+
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
         p, center = me["pos"], zone["next_center"]
         speed = max(1, me["stats"]["walk_speed"])
         self.remember(obs)
+        self.contested_drops(obs)
         time_left = max(0, zone["shrink_end"] - obs["t"])
         # Reserve walking time for the closing circle before seeking rewards.
         def travel_slack(target):
@@ -167,7 +188,7 @@ class Bot:
                 bonus = (75 if me["cubes"] < 3 else 54) - (obs["t"] - seen) * 0.9
                 goals.append((obj["pos"], bonus, 0))
         for obj in obs["drops"]:
-            if obj["holder"] not in (None, me["id"]):
+            if obj["holder"] not in (None, me["id"]) or self.drop_cooldown.get(obj["id"], -1) > obs["t"]:
                 continue
             arrival = distance(p, obj["pos"]) / speed
             wait = max(0, obj["lands_in"] - arrival)
@@ -316,10 +337,17 @@ class Bot:
 
         # Use the game's basic point-and-click interaction on visible sprites.
         primary = me["weapons"][0]
-        actors = [m for m in obs["mechs"] if distance(p, m["pos"]) < primary["stats"]["range"]]
+        visible = [m for m in obs["mechs"] if distance(p, m["pos"]) < primary["stats"]["range"]]
+        rivals = [m for m in visible if m["kind"] == "mech"]
+        # Drones grant no placement point and become active when interacted
+        # with. Harvest their cubes only in the opening when already nearby.
+        useful_drones = [m for m in visible if m["kind"] == "npc" and
+                         ((me["cubes"] < 3 and distance(p, m["pos"]) <= 44)
+                          or distance(p, m["pos"]) <= 18)]
+        actors = rivals or useful_drones
         if active_arc:
-            scored = [m for m in actors if m["kind"] == "mech" and distance(p, m["pos"]) < held["stats"]["range"]]
-            actors = scored or actors
+            arcade_range = [m for m in rivals if distance(p, m["pos"]) < held["stats"]["range"]]
+            actors = arcade_range or actors
         objects = actors or [c for c in obs["crates"] if distance(p, c["pos"]) < 80]
         if objects:
             target = min(objects, key=lambda obj: distance(p, obj["pos"]) + 0.023 * obj["hp"])
