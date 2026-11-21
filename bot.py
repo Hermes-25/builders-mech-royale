@@ -65,7 +65,6 @@ class Bot:
         self.resource_targets = set()
         self.item_values = {}
         self.next_swap = 0
-        self.unlock_crate = None
         try:
             self.surface = RewardSurface(hello["map"]["dir"])
         except (OSError, KeyError, ValueError, EOFError):
@@ -102,21 +101,6 @@ class Bot:
                           "lightning":72+15*min(near,3),
                           "mortar":34, "gun":-100}
 
-    def crate_opportunity(self, obs, milestone):
-        """Finish one nearby loot box when its cube immediately unlocks an offer."""
-        me=obs["self"];p=me["pos"]
-        if (milestone-me["cubes"]!=1 or obs["t"]>180 or me["hp"]<0.58*me["max_hp"]
-                or not me["in_zone"] or obs["zone"]["next_radius"]<70):
-            return None
-        if any(distance(p,c["pos"])<22 for c in obs["cubes"]):
-            return None
-        rivals=[m for m in obs["mechs"] if m["kind"]=="mech"]
-        if any(distance(p,m["pos"])<65 or m["hp"]<280 for m in rivals):
-            return None
-        possible=[c for c in obs["crates"] if distance(p,c["pos"])<=23
-                  and abs(c["pos"][2]-p[2])<5]
-        return min(possible,key=lambda c: distance(p,c["pos"])+c["hp"]*.027,default=None)
-
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
         p, center = me["pos"], zone["next_center"]
@@ -146,7 +130,6 @@ class Bot:
             cube_groups.setdefault(key,[]).append(q)
         milestones = self.config["cubes"]["upgrade_thresholds"]
         next_milestone = next((n for n in milestones if n>me["cubes"]),float("inf"))
-        self.unlock_crate = self.crate_opportunity(obs,next_milestone)
         for obj, seen in cubes:
             if self.reachable_reward(p, obj["pos"]):
                 bonus = (75 if me["cubes"] < 3 else 54) - (obs["t"] - seen) * 0.9
@@ -161,6 +144,7 @@ class Bot:
                 bonus += (gain-1)*18 + 20*(me["cubes"]+gain>=next_milestone)
                 resources.add(tuple(obj["pos"][:2]))
                 goals.append((obj["pos"], bonus, 0))
+        reservation=None
         for obj in obs["drops"]:
             if obj["holder"] not in (None, me["id"]):
                 continue
@@ -182,6 +166,17 @@ class Bot:
                 resources.add(tuple(focus[:2]))
                 bonus += 18 * (me["cubes"]+3>=next_milestone)
             goals.append((focus, bonus, 0.7))
+            if (obj["lands_in"]>0 and (healing>0.18 or me["energy"]<0.45*me["max_energy"]
+                    or me["cubes"]+3>=next_milestone)):
+                # Drop grants full health/energy and three cubes. Reserve its
+                # public landing time when our route can still reach the ring.
+                radius=obj["radius"]*0.70
+                direct=max(0,distance(p,obj["pos"])-radius)/speed
+                their_eta=min((max(0,distance(other,obj["pos"])-radius)/speed for other in crowd),default=100)
+                if direct<=obj["lands_in"]+3 and their_eta+3>direct:
+                    candidate=(bonus,obj["pos"],radius,obj["lands_in"],direct,tuple(focus[:2]))
+                    if reservation is None or bonus>reservation[0]:
+                        reservation=candidate
         held = me["weapons"][1]
         if not held or obs["t"] >= self.next_swap:
             for obj, seen in self.items["pickups"].values():
@@ -193,8 +188,7 @@ class Bot:
                     goals.append((obj["pos"], value - (obs["t"] - seen), 0))
         for obj, seen in self.items["crates"].values():
             if me["cubes"] < 6 and self.reachable_reward(p, obj["pos"]):
-                unlock=76 if self.unlock_crate and obj["id"]==self.unlock_crate["id"] else 0
-                goals.append((obj["pos"], 36+unlock-(obs["t"]-seen), 5 if unlock else 6))
+                goals.append((obj["pos"], 36 - (obs["t"] - seen), 6))
 
         # Pick local waypoints when the next circle is far away. They adapt to
         # the current avatar density while preserving time to reach that circle.
@@ -220,7 +214,18 @@ class Bot:
                 their_time=min((distance(q,pt)/speed for q in crowd),default=100)
                 if our_time<2.8 and our_time <= their_time+0.4:
                     threat_weight=0.14 if me["hp"]>me["max_hp"]*.5 else 0.35
-            return (reward + continuity - 0.46 * max(0, distance(p, pt) - stop)
+            timetable=0
+            if reservation is not None:
+                _,site,radius,lands,direct,ring=reservation
+                via=(distance(p,pt)+max(0,distance(pt,site)-radius))/speed
+                lost=max(0,via-lands+0.9)-max(0,direct-lands+0.9)
+                if tuple(pt[:2])==ring:
+                    timetable=32 if direct+3.0>=lands else -16
+                else:
+                    timetable=-min(70,15*max(0,lost))
+                    if tuple(pt[:2]) in resources and via+1.3<lands:
+                        timetable+=22
+            return (reward + continuity + timetable - 0.46 * max(0, distance(p, pt) - stop)
                     - threat_weight * exposure - 2 * max(0, boundary)
                     - 12 * max(0, 2 - slack))
 
@@ -335,8 +340,7 @@ class Bot:
         if active_arc:
             scored = [m for m in actors if m["kind"] == "mech" and distance(p, m["pos"]) < held["stats"]["range"]]
             actors = scored or actors
-        objects = ([self.unlock_crate] if self.unlock_crate else actors) or [
-            c for c in obs["crates"] if distance(p, c["pos"]) < 80]
+        objects = actors or [c for c in obs["crates"] if distance(p, c["pos"]) < 80]
         if objects:
             if held and held["kind"] == "laser" and rivals:
                 # One HP counter reaching zero earns a placement. Prefer a
