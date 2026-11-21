@@ -68,9 +68,7 @@ class Bot:
         self.sequence_at = -2
         self.sequence_key = None
         self.sequence_first = None
-        self.card_activity=deque()
-        self.last_card_tick=0
-        self.last_health_cost=-50
+        self.motion_budget = None
         try:
             self.surface = RewardSurface(hello["map"]["dir"])
         except (OSError, KeyError, ValueError, EOFError):
@@ -243,7 +241,15 @@ class Bot:
             dt = now - previous_time
             if 0.03 <= dt <= 0.25:
                 expected = max(0.25, dt * speed)
-                missing = [cmd[i] - (p[i] - old[i]) / expected for i in (0, 1)]
+                if self.motion_budget:
+                    prior,cap,accel=self.motion_budget
+                    target=(cmd[0]*cap,cmd[1]*cap)
+                    delta=(target[0]-prior[0],target[1]-prior[1])
+                    factor=min(1,accel*dt/max(.01,math.hypot(*delta)))
+                    predicted=(prior[0]+factor*delta[0],prior[1]+factor*delta[1])
+                    missing=[(predicted[i]-(p[i]-old[i])/dt)/max(1,cap) for i in (0,1)]
+                else:
+                    missing = [cmd[i] - (p[i] - old[i]) / expected for i in (0, 1)]
                 self.obstruction.append(tuple(max(-1, min(1, v)) for v in missing))
             else:
                 self.obstruction.clear()
@@ -371,18 +377,6 @@ class Bot:
         p, now = me["pos"], obs["t"]
         goal, stop = self.destination(obs)
         goal, stop = self.resource_sequence(obs,goal,stop)
-        dt=min(.3,max(0,now-self.last_card_tick))
-        self.last_card_tick=now
-        for event in obs["events"]:
-            if event["type"]=="damaged":
-                self.last_health_cost=now
-                self.card_activity.append((now,"lost",event["amount"]))
-            elif event["type"]=="hit" and event.get("target",1000)<100:
-                self.card_activity.append((now,event["weapon"],event["amount"]))
-        if me["hp"]<.95*me["max_hp"] and now-self.last_health_cost>=me["stats"]["regen_delay"]-1.5:
-            self.card_activity.append((now,"regen",dt))
-        while self.card_activity and self.card_activity[0][0]<now-32:
-            self.card_activity.popleft()
         resting = distance(p, goal) <= max(0.6, stop)
         dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
         if me["energy"] < 0.24 * me["max_energy"]:
@@ -408,26 +402,6 @@ class Bot:
             choices = obs["offer"]["choices"]
             action["pick"] = max(range(len(choices)), key=lambda i:
                 len(preference) - preference.index(choices[i]["id"]) if choices[i]["id"] in preference else 0)
-            activity={}
-            for _,kind,amount in self.card_activity:
-                activity[kind]=activity.get(kind,0)+amount
-            # Use a small prior at spawn then buy the card with the greatest
-            # expected change to the avatar's recently used game meters.
-            base_hp=self.config["mech"]["hp"]
-            gun_points=650+activity.get("gun",0)*.8
-            laser_points=650+activity.get("laser",0)*.8
-            arc_points=650+activity.get("lightning",0)*.8
-            hp_ratio=me["hp"]/me["max_hp"]
-            benefits={
-                "plating":base_hp*.15*(1.2-.30*hp_ratio),
-                "armor":(900+activity.get("lost",0))*.08/max(.55,1-me["stats"].get("armor",0)),
-                "nanites":65+min(220,activity.get("regen",0)*19),
-                "gun_damage":.15*gun_points,"gun_rate":.105*gun_points,"gun_mag":.23*gun_points,
-                "laser_damage":.18*laser_points,"laser_charge":.085*laser_points,
-                "laser_pierce":.035*laser_points,"lightning_efficiency":.20*arc_points,
-                "lightning_range":.18*arc_points,"lightning_chain":.08*arc_points,
-                "servos":100,"reactor":50,"jets":43,"capacitor":44,"sensors":55}
-            action["pick"]=max(range(len(choices)),key=lambda i:benefits.get(choices[i]["id"],25))
         if not held or now >= self.next_swap:
             nearby = [item for item in obs["pickups"] if
                       self.item_values[item["kind"]] > (self.item_values[held["kind"]]+11 if held else 0)
@@ -486,6 +460,13 @@ class Bot:
         else:
             action["aim"] = [math.atan2(dy, dx) + 0.9 * math.sin(now * 0.7), 0]
             action["reload"] = primary.get("ammo", 0) < primary["stats"].get("mag", 0) * 0.7
+        stats=me["stats"]
+        cap=stats["boost_speed"] if action["boost"] and me["grounded"] else stats["walk_speed"]
+        if any(w and w["kind"]=="laser" and w.get("cooldown",0)<=.1 and
+               action.get("fire",[False,False])[i] for i,w in enumerate(me["weapons"])):
+            cap*=stats.get("charge_move_mult",self.config["mech"]["charge_move_mult"])
+        accel=stats["ground_accel"] if me["grounded"] else stats["air_accel"]
+        self.motion_budget=(tuple(me["vel"][:2]),cap,accel)
         return action
 
 
