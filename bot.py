@@ -51,6 +51,11 @@ class Bot:
     name = "Afterglow"
 
     def __init__(self, hello):
+        self.camera_cues=False
+        self.camera_seen={}
+        self.camera_next=-1.
+        self.camera_observe=-1.
+        self.camera_point=0.
         self.config = hello["config"]
         self.phase = (hello["slot"] * 2.39996) % math.tau
         self.positions = deque(maxlen=12)
@@ -400,28 +405,40 @@ class Bot:
             return n[1],2 if n[0]=="drop" else 0
         return original,stop
 
-    def arrival(self,obs,goal,action,blocked):
-        me=obs["self"];p=me["pos"]
-        if blocked or not me["grounded"] or not self.collectible_at.get(tuple(goal[:2])):return
-        if abs(p[2]-goal[2])>3.5:return
-        d=distance(p,goal)
-        if d>20 or d<.25:return
-        stats=me["stats"];vx,vy=me["vel"][:2]
-        ux,uy=direction(p,goal);speed=max(1.,stats["walk_speed"])
-        acc=max(1.,stats["ground_accel"])
-        radius=self.config["cubes"]["pickup_radius"]
-        forward=vx*ux+vy*uy
-        stopping=forward*abs(forward)/(2*acc)
-        side_x,side_y=vx-forward*ux,vy-forward*uy
-        horizon=max(.14,min(.42,d/speed))
-        # Counter the measured sideways drift at the collectible, then brake
-        # within its game radius. Navigation to distant objectives is unaffected.
-        if math.hypot(side_x,side_y)*horizon<.7 and d-stopping>radius:return
-        target=min(speed,math.sqrt(max(0.,2*acc*(d-radius*.55))))
-        dx=(ux*target-.7*side_x)/speed;dy=(uy*target-.7*side_y)/speed
-        scale=max(1.,math.hypot(dx,dy))
-        action["move"]=[dx/scale,dy/scale]
-        action["boost"]=False
+    def scan_rewards(self,obs,action):
+        me=obs["self"];p=me["pos"];now=obs["t"];camera=me["aim"][0]
+        if now>100 or (me["cubes"]>=3 and me["weapons"][1]):return
+        # The near sensor is omnidirectional. Track the distant cells actually
+        # inside the current viewing wedge before commanding a different view.
+        def cells(yaw):
+            for angle in (yaw-.78,yaw-.38,yaw,yaw+.38,yaw+.78):
+                cx,cy=math.cos(angle),math.sin(angle)
+                for reach in (62.,98.,143.):
+                    yield (math.floor((p[0]+reach*cx)/32),math.floor((p[1]+reach*cy)/32))
+        if now>=self.camera_observe:
+            self.camera_observe=now+.35
+            for key in cells(camera):self.camera_seen[key]=now
+        if any(m["kind"]=="mech" for m in obs["mechs"]):return
+        if any(action.get("fire",())):
+            return
+        if now>=self.camera_next:
+            def fresh(theta):
+                # Newly revealed loot has value first; return to a stale sector
+                # after eight seconds. Turning and rearward scans consume a tick.
+                values=(min(1.,(now-self.camera_seen.get(key,-50.))/8) for key in cells(theta))
+                movement=action.get("move",(0,0))
+                return (sum(values)/15.+.14*math.cos(camera-theta)+
+                        .17*(movement[0]*math.cos(theta)+movement[1]*math.sin(theta)))
+            angles=[self.phase+i*math.tau/12 for i in range(12)]
+            self.camera_point=max(angles,key=fresh)
+            if self.camera_cues:
+                fresh_crates=[cue for cue in obs.get("sounds",[]) if cue["kind"]=="crate" and
+                              cue["dist"] in ("near","mid") and cue["age"]<.65]
+                if fresh_crates:
+                    cue=min(fresh_crates,key=lambda c:(c["dist"]!="near",c["age"]))
+                    self.camera_point=cue["bearing"]
+            self.camera_next=now+.85
+        action["aim"]=[self.camera_point,0.]
 
     def act(self, obs):
         me = obs["self"]
@@ -572,7 +589,7 @@ class Bot:
         else:
             action["aim"] = [math.atan2(dy, dx) + 0.9 * math.sin(now * 0.7), 0]
             action["reload"] = primary.get("ammo", 0) < primary["stats"].get("mag", 0) * 0.7
-        self.arrival(obs,goal,action,blocked)
+        self.scan_rewards(obs,action)
         return action
 
 
