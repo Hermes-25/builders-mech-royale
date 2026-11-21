@@ -49,6 +49,9 @@ class RewardSurface:
 
 class Bot:
     name = "Afterglow"
+    early_gear_value = 1.48
+    early_cube_value = 1.2
+    nearby_crate_distance = 18
 
     def __init__(self, hello):
         self.config = hello["config"]
@@ -68,9 +71,6 @@ class Bot:
         self.sequence_at = -2
         self.sequence_key = None
         self.sequence_first = None
-        self.card_activity=deque()
-        self.last_card_tick=0
-        self.last_health_cost=-50
         self.discovered_tiles = set()
         self.scan_tick = -2
         self.explore_goal = None
@@ -155,6 +155,8 @@ class Bot:
                             if gain==4:break
                     if gain==4:break
                 bonus += (gain-1)*18 + 20*(me["cubes"]+gain>=next_milestone)
+                if obs["t"] < 70 and me["cubes"] < 6:
+                    bonus *= self.early_cube_value
                 resources.add(tuple(obj["pos"][:2]))
                 goals.append((obj["pos"], bonus, 0))
         for obj in obs["drops"]:
@@ -186,7 +188,10 @@ class Bot:
                 if desired and self.reachable_reward(p, obj["pos"]):
                     if value >= 72:
                         resources.add(tuple(obj["pos"][:2]))
-                    goals.append((obj["pos"], value - (obs["t"] - seen), 0))
+                    priority=value
+                    if obs["t"]<70 and (not held or held["kind"]=="mortar") and value>=72:
+                        priority *= self.early_gear_value
+                    goals.append((obj["pos"], priority - (obs["t"] - seen), 0))
         for obj, seen in self.items["crates"].values():
             if me["cubes"] < 6 and self.reachable_reward(p, obj["pos"]):
                 goals.append((obj["pos"], 36 - (obs["t"] - seen), 6))
@@ -392,8 +397,8 @@ class Bot:
             known = any(it["kind"] in ("laser","lightning") and now-seen<9 and
                         distance(p,it["pos"])<125 and self.reachable_reward(p,it["pos"])
                         for it,seen in self.items["pickups"].values())
-            near_box = me["cubes"] < 6 and any(
-                distance(p,c["pos"]) < 24 and self.reachable_reward(p,c["pos"]) for c in obs["crates"])
+            near_box = me["cubes"]<6 and any(distance(p,c["pos"]) < self.nearby_crate_distance
+                and self.reachable_reward(p,c["pos"]) for c in obs["crates"])
             z=obs["zone"]
             if (not (known or waiting or near_box) and me["in_zone"] and
                     me["hp"]>.52*me["max_hp"] and distance(p,z["center"])<z["radius"]-28):
@@ -435,18 +440,6 @@ class Bot:
                     self.explore_at=now
                 if self.explore_goal is not None:
                     goal,stop=self.explore_goal,0
-        dt=min(.3,max(0,now-self.last_card_tick))
-        self.last_card_tick=now
-        for event in obs["events"]:
-            if event["type"]=="damaged":
-                self.last_health_cost=now
-                self.card_activity.append((now,"lost",event["amount"]))
-            elif event["type"]=="hit" and event.get("target",1000)<100:
-                self.card_activity.append((now,event["weapon"],event["amount"]))
-        if me["hp"]<.95*me["max_hp"] and now-self.last_health_cost>=me["stats"]["regen_delay"]-1.5:
-            self.card_activity.append((now,"regen",dt))
-        while self.card_activity and self.card_activity[0][0]<now-32:
-            self.card_activity.popleft()
         resting = distance(p, goal) <= max(0.6, stop)
         dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
         if me["energy"] < 0.24 * me["max_energy"]:
@@ -472,26 +465,6 @@ class Bot:
             choices = obs["offer"]["choices"]
             action["pick"] = max(range(len(choices)), key=lambda i:
                 len(preference) - preference.index(choices[i]["id"]) if choices[i]["id"] in preference else 0)
-            activity={}
-            for _,kind,amount in self.card_activity:
-                activity[kind]=activity.get(kind,0)+amount
-            # Use a small prior at spawn then buy the card with the greatest
-            # expected change to the avatar's recently used game meters.
-            base_hp=self.config["mech"]["hp"]
-            gun_points=650+activity.get("gun",0)*.8
-            laser_points=650+activity.get("laser",0)*.8
-            arc_points=650+activity.get("lightning",0)*.8
-            hp_ratio=me["hp"]/me["max_hp"]
-            benefits={
-                "plating":base_hp*.15*(1.2-.30*hp_ratio),
-                "armor":(900+activity.get("lost",0))*.08/max(.55,1-me["stats"].get("armor",0)),
-                "nanites":65+min(220,activity.get("regen",0)*19),
-                "gun_damage":.15*gun_points,"gun_rate":.105*gun_points,"gun_mag":.23*gun_points,
-                "laser_damage":.18*laser_points,"laser_charge":.085*laser_points,
-                "laser_pierce":.035*laser_points,"lightning_efficiency":.20*arc_points,
-                "lightning_range":.18*arc_points,"lightning_chain":.08*arc_points,
-                "servos":100,"reactor":50,"jets":43,"capacitor":44,"sensors":55}
-            action["pick"]=max(range(len(choices)),key=lambda i:benefits.get(choices[i]["id"],25))
         if not held or now >= self.next_swap:
             nearby = [item for item in obs["pickups"] if
                       self.item_values[item["kind"]] > (self.item_values[held["kind"]]+11 if held else 0)
