@@ -27,8 +27,11 @@ class Bot:
         self.phase = (hello["slot"] * 2.39996) % math.tau
         self.positions = deque(maxlen=12)
         self.boosting = False
-        self.detour_until = 0
-        self.detour_sign = 1
+        self.contact = None
+        self.preference = 1 if hello["slot"] % 2 else -1
+        self.last_step = None
+        self.obstruction = deque(maxlen=7)
+        self.last_reverse = -10
 
     def destination(self, obs):
         me, zone = obs["self"], obs["zone"]
@@ -81,22 +84,64 @@ class Bot:
         best, _, stop = max(goals, key=score)
         return best, stop
 
+    def navigate(self, p, goal, resting, now, speed):
+        """Trace a boundary from the avatar's observed displacement.
+
+        Sliding along a tile's edge reveals which component of the previous
+        command did not move the avatar. Preserve the side of the detour until
+        it crosses the original contact plane.
+        """
+        dx, dy = direction(p, goal)
+        if resting:
+            self.contact = self.last_step = None
+            self.obstruction.clear()
+            self.positions.clear()
+            return 0, 0, False
+        self.positions.append(tuple(p[:2]))
+        if self.last_step:
+            old, cmd, previous_time = self.last_step
+            dt = now - previous_time
+            if 0.03 <= dt <= 0.25:
+                expected = max(0.25, dt * speed)
+                missing = [cmd[i] - (p[i] - old[i]) / expected for i in (0, 1)]
+                self.obstruction.append(tuple(max(-1, min(1, v)) for v in missing))
+            else:
+                self.obstruction.clear()
+        if self.contact:
+            origin, normal, tangent, until, prior_goal = self.contact
+            crossed = sum((p[i] - origin[i]) * normal[i] for i in (0, 1))
+            if crossed > 3 or now >= until or distance(goal, prior_goal) > 35:
+                self.contact = None
+                self.obstruction.clear()
+            elif (len(self.positions) == self.positions.maxlen and now - self.last_reverse > 2.3
+                    and distance(p, self.positions[0]) < 1.6):
+                tangent = (-tangent[0], -tangent[1])
+                self.contact = (origin, normal, tangent, now + 14, prior_goal)
+                self.last_reverse = now
+        if not self.contact and len(self.obstruction) == self.obstruction.maxlen:
+            loss = [sum(v[i] for v in self.obstruction) / len(self.obstruction) for i in (0, 1)]
+            magnitude = math.hypot(*loss)
+            if magnitude > 0.38 and loss[0] * dx + loss[1] * dy > 0.26:
+                normal = (loss[0] / magnitude, loss[1] / magnitude)
+                tangent = (-normal[1], normal[0])
+                ahead = tangent[0] * dx + tangent[1] * dy
+                side = self.preference if abs(ahead) < 0.18 else (1 if ahead > 0 else -1)
+                tangent = (tangent[0] * side, tangent[1] * side)
+                self.contact = (tuple(p[:2]), normal, tangent, now + 14, tuple(goal[:2]))
+                self.last_reverse = now
+        if self.contact:
+            _, normal, tangent, _, _ = self.contact
+            dx = 0.42 * normal[0] + 0.90 * tangent[0]
+            dy = 0.42 * normal[1] + 0.90 * tangent[1]
+        self.last_step = (tuple(p[:2]), (dx, dy), now)
+        return dx, dy, self.contact is not None
+
     def act(self, obs):
         me = obs["self"]
         p, now = me["pos"], obs["t"]
         goal, stop = self.destination(obs)
-        dx, dy = direction(p, goal)
         resting = distance(p, goal) <= max(0.6, stop)
-        self.positions.append(tuple(p[:2]))
-        blocked = (len(self.positions) == self.positions.maxlen and not resting
-                   and distance(self.positions[0], p) < 1.25)
-        if blocked and now >= self.detour_until:
-            self.detour_sign *= -1
-            self.detour_until = now + 1.3
-        if resting:
-            dx = dy = 0
-        elif now < self.detour_until:
-            dx, dy = 0.45 * dx - self.detour_sign * 0.88 * dy, 0.45 * dy + self.detour_sign * 0.88 * dx
+        dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
         if me["energy"] < 0.24 * me["max_energy"]:
             self.boosting = False
         elif me["energy"] > 0.85 * me["max_energy"]:
@@ -133,7 +178,7 @@ class Bot:
             if item:
                 kind = item["kind"]
                 if kind == "laser":
-                    secondary = item.get("charge", 0) < item["stats"].get("charge_s", 0.8)
+                    secondary = item.get("charge", 0) < item["stats"].get("charge", 0.75)
                 elif kind == "lightning":
                     secondary = distance(p, q) <= item["stats"]["range"]
                 else:
