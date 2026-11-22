@@ -55,6 +55,9 @@ class Bot:
         self.work_order=None
         self.stop_work={}
         self.foreground_reward=None
+        self.port_style="mean"
+        self.port_choice=None
+        self.port_clock=-1.
         self.config = hello["config"]
         self.phase = (hello["slot"] * 2.39996) % math.tau
         self.positions = deque(maxlen=12)
@@ -315,95 +318,74 @@ class Bot:
         self.last_step = (tuple(p[:2]), (dx, dy), now)
         return dx, dy, self.contact is not None
 
-    def resource_sequence(self, obs, original, stop):
-        """Look three rewards ahead before changing the next pickup.
-
-        Each route carries its own inventory, cube count and arrival time.
-        Item eligibility, upgrade thresholds and public drop timers therefore
-        depend on which reward is collected first.
-        """
-        me=obs["self"];p=me["pos"];now=obs["t"];zone=obs["zone"]
-        if (not me["in_zone"] or zone["next_radius"]<35 or
-                me["hp"]<0.42*me["max_hp"]):
-            return original,stop
-        speed=max(1,me["stats"]["walk_speed"])
-        held=me["weapons"][1]
-        equipped=held["kind"] if held else ""
-        # Cluster only cubes already collectible from the representative
-        # cube's actual location. Other cubes remain separate route stages.
-        loose=sorted((c for c,seen in self.items["cubes"].values()
-                      if now-seen<5 and self.reachable_reward(p,c["pos"])),
-                     key=lambda c:distance(p,c["pos"]))[:16]
-        nodes=[];used=set()
-        for cube in loose:
-            if cube["id"] in used:continue
-            q=cube["pos"]
-            group=[c for c in loose if c["id"] not in used and abs(q[2]-c["pos"][2])<3
-                   and distance(q,c["pos"])<=self.config["cubes"]["pickup_radius"]-.5]
-            used.update(c["id"] for c in group)
-            nodes.append(("cube",q,len(group),0.,0.,cube["id"]))
-        gear=sorted((item for item,seen in self.items["pickups"].values() if now-seen<5
-                     and item["kind"] in ("laser","lightning") and self.reachable_reward(p,item["pos"])
-                     and self.item_values[item["kind"]]>self.item_values.get(equipped,0)+11),
-                    key=lambda item:distance(p,item["pos"]))[:3]
-        for item in gear:
-            nodes.append((item["kind"],item["pos"],0,0.,0.,item["id"]))
-        for drop in obs["drops"]:
-            if drop["holder"] in (None,me["id"]):
-                nodes.append(("drop",drop["pos"],3,drop["lands_in"],drop["capture_s"]-drop["progress"],drop["id"]))
-        nodes=sorted((n for n in nodes if distance(p,n[1])/speed<11.5),
-                     key=lambda n:distance(p,n[1]))[:10]
-        if len(nodes)<2:return original,stop
-        nearest=min(range(len(nodes)),key=lambda i:distance(original,nodes[i][1]))
-        if distance(original,nodes[nearest][1])>8:
-            return original,stop
-        if nodes[nearest][0]=="drop" and nodes[nearest][3]<4:
-            # Honor the incumbent's choice to finish an imminent timed
-            # capture. A detour can reset all banked capture time.
-            return original,stop
-        key=(tuple(sorted(n[-1] for n in nodes)),nodes[nearest][-1],me["cubes"],equipped)
-        if key==self.sequence_key and now-self.sequence_at<.45:
-            if self.sequence_first is None:return original,stop
-            for n in nodes:
-                if n[-1]==self.sequence_first:return n[1],2 if n[0]=="drop" else 0
-        self.sequence_key=key;self.sequence_at=now;self.sequence_first=None
+    def portfolio(self,obs,original,stop):
+        now=obs["t"];me=obs["self"];p=me["pos"];z=obs["zone"]
+        if not me["in_zone"] or z["next_radius"]<30 or me["hp"]<.42*me["max_hp"]:return original,stop
+        if self.port_clock>now and self.port_choice:
+            key,point,range_=self.port_choice
+            if any(key==q["id"] for typ in ("cubes","pickups","drops") for q in obs[typ]):
+                return point,range_
+        self.port_clock=now+.45;self.port_choice=None
+        speed=max(1.,me["stats"]["walk_speed"]);held=me["weapons"][1];slot=held["kind"] if held else ""
         rivals=[m["pos"] for m in obs["mechs"] if m["kind"]=="mech"]
-        steps=self.config["cubes"]["upgrade_thresholds"]
-        time_to=[distance(p,n[1])/speed for n in nodes]
-        transit=[[distance(a[1],b[1])/speed for b in nodes] for a in nodes]
-        contest=[min((distance(r,n[1])/speed for r in rivals),default=100) for n in nodes]
-        best_by_first=[0.]*len(nodes)
-        def extend(previous,elapsed,total,cubes,slot,first,visited,depth):
-            for i,n in enumerate(nodes):
-                if visited & (1<<i):continue
-                kind,pt,gain,landing,dwell,_=n
-                arrives=elapsed+(time_to[i] if previous<0 else transit[previous][i])
-                end=max(arrives,landing)+dwell
-                if end>13.5:continue
-                remaining=zone["shrink_end"]-now-end
-                if max(0,distance(pt,zone["next_center"])-zone["next_radius"]+5)/speed>remaining:continue
-                ability=slot
-                if kind in ("laser","lightning"):
-                    upgrade=self.item_values[kind]-self.item_values.get(slot,0)
-                    if upgrade<=11:continue
-                    reward=0.69*upgrade;ability=kind
-                else:
-                    levels=sum(cubes<k<=cubes+gain for k in steps)
-                    reward=13*(min(10,cubes+gain)-min(10,cubes))+levels*(26+11*(slot in ("laser","lightning")))
-                    if kind=="drop":
-                        reward+=65*(1-me["hp"]/max(1,me["max_hp"]))+12*(1-me["energy"]/max(1,me["max_energy"]))
-                reliability=max(.42,min(1,.80+.13*(contest[i]-arrives)))
-                nxt=total+reward*math.exp(-end/8.2)*reliability
-                idx=i if first is None else first
-                best_by_first[idx]=max(best_by_first[idx],nxt)
-                if depth<3:
-                    extend(i,end,nxt,cubes+gain,ability,idx,visited|(1<<i),depth+1)
-        extend(-1,0.,0.,me["cubes"],equipped,None,0,1)
-        chosen=max(range(len(nodes)),key=best_by_first.__getitem__)
-        if chosen!=nearest and best_by_first[chosen]>best_by_first[nearest]*1.14+3:
-            n=nodes[chosen];self.sequence_first=n[-1]
-            return n[1],2 if n[0]=="drop" else 0
-        return original,stop
+        cards=self.config["cubes"]["upgrade_thresholds"];radius=self.config["cubes"]["pickup_radius"]
+        pool=[];used=set()
+        loose=sorted((q for q,t in self.items["cubes"].values() if now-t<4 and self.reachable_reward(p,q["pos"])),key=lambda q:distance(p,q["pos"]))[:17]
+        for c in loose:
+            if c["id"] in used:continue
+            q=c["pos"];group=[o for o in loose if o["id"] not in used and abs(o["pos"][2]-q[2])<3.5 and distance(o["pos"],q)<=radius-.3]
+            used.update(o["id"] for o in group)
+            pool.append((c["id"],"cube",q,len(group),0.,0.,0.))
+        for item,seen in self.items["pickups"].values():
+            kind=item["kind"]
+            if (now-seen<5 and kind in ("laser","lightning") and self.reachable_reward(p,item["pos"])
+                    and self.item_values[kind]>self.item_values.get(slot,0)+11):
+                pool.append((item["id"],kind,item["pos"],0,0.,0.,0.))
+        for d in obs["drops"]:
+            if d["holder"] in (None,me["id"]):pool.append((d["id"],"drop",d["pos"],3,max(0.,d["lands_in"]),max(.2,d["capture_s"]-d["progress"]),.6*d["radius"]))
+        pool=sorted((n for n in pool if distance(p,n[2])/speed<12),key=lambda n:distance(p,n[2]))[:11]
+        if not pool:return original,stop
+        # Beam states carry their own inventory and clock, so acquiring an
+        # identical card twice or assuming an instantaneous capture has no value.
+        work=[(0.,0.,tuple(p[:2]),me["cubes"],slot,-1,0)]
+        best={};current=None
+        for i,n in enumerate(pool):
+            if distance(original,n[2])<max(4.,n[6]):current=i
+        for depth in range(3):
+            new=[]
+            for total,elapsed,at,cubes,gear,first,mask in work:
+                for i,(key,kind,q,gain,landing,service,stopr) in enumerate(pool):
+                    if mask&(1<<i):continue
+                    arrive=elapsed+max(0.,distance(at,q)-stopr)/speed
+                    end=max(arrive,landing)+service
+                    if end>16:continue
+                    back=max(0.,distance(q,z["next_center"])-z["next_radius"]+5)/speed
+                    if back>0 and end+back+3>max(0.,z["shrink_end"]-now):continue
+                    nextgear=gear
+                    if kind in ("cube","drop"):
+                        thresholds=sum(cubes<k<=cubes+gain for k in cards)
+                        gainvalue=17.*(min(10,cubes+gain)-min(10,cubes))+32.*thresholds
+                        if kind=="drop":gainvalue+=91.*(1-me["hp"]/max(1.,me["max_hp"]))+10.
+                    else:
+                        gainvalue=.7*(self.item_values[kind]-self.item_values.get(gear,0))
+                        if gainvalue<=8:continue
+                        nextgear=kind
+                    rt=min((distance(q,r)/speed for r in rivals),default=90.)
+                    chance=max(.2,min(1.,.82+.12*(rt-arrive)))
+                    if self.port_style=="robust" and rt+1.5<arrive:chance*=.42
+                    value=total+gainvalue*chance*math.exp(-end/7.7)
+                    head=i if first<0 else first
+                    best[head]=max(best.get(head,0.),value)
+                    new.append((value,end,tuple(q[:2]),cubes+gain,nextgear,head,mask|(1<<i)))
+            work=sorted(new,key=lambda st:st[0],reverse=True)[:7]
+        if not best:return original,stop
+        idx=max(best,key=best.get)
+        if current==idx:return original,stop
+        threshold=best.get(current,0.)*1.12+3. if current is not None else 29.
+        if self.work_order and current is None:threshold+=13.
+        if best[idx]<=threshold:return original,stop
+        key,kind,q,gain,land,service,stopr=pool[idx]
+        self.port_choice=(key,q,stopr);return q,stopr
 
     def arrival(self,obs,goal,action,blocked):
         me=obs["self"];p=me["pos"]
@@ -504,7 +486,6 @@ class Bot:
         me = obs["self"]
         p, now = me["pos"], obs["t"]
         goal, stop = self.destination(obs)
-        goal, stop = self.resource_sequence(obs,goal,stop)
         if now < 125 and self.seek_specialty:
             cell = 28
             if now-self.scan_tick >= .65:
@@ -569,6 +550,7 @@ class Bot:
             goal,stop=self.harvest(obs,goal,stop)
         else:
             self.work_order=None;self.foreground_reward=None
+        goal,stop=self.portfolio(obs,goal,stop)
         self.observe_collection(obs,goal)
         resting = distance(p, goal) <= max(0.6, stop)
         dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
