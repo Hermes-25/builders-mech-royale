@@ -51,11 +51,10 @@ class Bot:
     name = "Afterglow"
 
     def __init__(self, hello):
-        self.camera_cues=False
-        self.camera_seen={}
-        self.camera_next=-1.
-        self.camera_observe=-1.
-        self.camera_point=0.
+        self.seek_specialty=True
+        self.work_order=None
+        self.stop_work={}
+        self.foreground_reward=None
         self.config = hello["config"]
         self.phase = (hello["slot"] * 2.39996) % math.tau
         self.positions = deque(maxlen=12)
@@ -155,6 +154,7 @@ class Bot:
         speed = max(1, me["stats"]["walk_speed"])
         self.remember(obs)
         self.value_items(obs)
+        self.choose_specialty(obs)
         time_left = max(0, zone["shrink_end"] - obs["t"])
         # Reserve walking time for the closing circle before seeking rewards.
         def travel_slack(target):
@@ -405,47 +405,107 @@ class Bot:
             return n[1],2 if n[0]=="drop" else 0
         return original,stop
 
-    def scan_rewards(self,obs,action):
-        me=obs["self"];p=me["pos"];now=obs["t"];camera=me["aim"][0]
-        if now>100 or (me["cubes"]>=3 and me["weapons"][1]):return
-        # The near sensor is omnidirectional. Track the distant cells actually
-        # inside the current viewing wedge before commanding a different view.
-        def cells(yaw):
-            for angle in (yaw-.78,yaw-.38,yaw,yaw+.38,yaw+.78):
-                cx,cy=math.cos(angle),math.sin(angle)
-                for reach in (62.,98.,143.):
-                    yield (math.floor((p[0]+reach*cx)/32),math.floor((p[1]+reach*cy)/32))
-        if now>=self.camera_observe:
-            self.camera_observe=now+.35
-            for key in cells(camera):self.camera_seen[key]=now
-        if any(m["kind"]=="mech" for m in obs["mechs"]):return
-        if any(action.get("fire",())):
-            return
-        if now>=self.camera_next:
-            def fresh(theta):
-                # Newly revealed loot has value first; return to a stale sector
-                # after eight seconds. Turning and rearward scans consume a tick.
-                values=(min(1.,(now-self.camera_seen.get(key,-50.))/8) for key in cells(theta))
-                movement=action.get("move",(0,0))
-                return (sum(values)/15.+.14*math.cos(camera-theta)+
-                        .17*(movement[0]*math.cos(theta)+movement[1]*math.sin(theta)))
-            angles=[self.phase+i*math.tau/12 for i in range(12)]
-            self.camera_point=max(angles,key=fresh)
-            if self.camera_cues:
-                fresh_crates=[cue for cue in obs.get("sounds",[]) if cue["kind"]=="crate" and
-                              cue["dist"] in ("near","mid") and cue["age"]<.65]
-                if fresh_crates:
-                    cue=min(fresh_crates,key=lambda c:(c["dist"]!="near",c["age"]))
-                    self.camera_point=cue["bearing"]
-            self.camera_next=now+.85
-        action["aim"]=[self.camera_point,0.]
+    def arrival(self,obs,goal,action,blocked):
+        me=obs["self"];p=me["pos"]
+        if blocked or not me["grounded"] or not self.collectible_at.get(tuple(goal[:2])):return
+        if abs(p[2]-goal[2])>3.5:return
+        d=distance(p,goal)
+        if d>20 or d<.25:return
+        stats=me["stats"];vx,vy=me["vel"][:2]
+        ux,uy=direction(p,goal);speed=max(1.,stats["walk_speed"])
+        acc=max(1.,stats["ground_accel"])
+        radius=self.config["cubes"]["pickup_radius"]
+        forward=vx*ux+vy*uy
+        stopping=forward*abs(forward)/(2*acc)
+        side_x,side_y=vx-forward*ux,vy-forward*uy
+        horizon=max(.14,min(.42,d/speed))
+        # Counter the measured sideways drift at the collectible, then brake
+        # within its game radius. Navigation to distant objectives is unaffected.
+        if math.hypot(side_x,side_y)*horizon<.7 and d-stopping>radius:return
+        target=min(speed,math.sqrt(max(0.,2*acc*(d-radius*.55))))
+        dx=(ux*target-.7*side_x)/speed;dy=(uy*target-.7*side_y)/speed
+        scale=max(1.,math.hypot(dx,dy))
+        action["move"]=[dx/scale,dy/scale]
+        action["boost"]=False
+
+    def choose_specialty(self,obs):
+        me=obs["self"];held=me["weapons"][1];zone=obs["zone"];p=me["pos"]
+        # Compare the game's distinct periodic abilities. Read the current
+        # loadout and card stacks so an accomplished chain build is retained.
+        cards=me.get("upgrades",{})
+        if isinstance(cards,dict):
+            arc_levels=sum(n for k,n in cards.items() if k.startswith("lightning") and isinstance(n,(float,int)))
+        else:
+            arc_levels=sum(str(k).startswith("lightning") for k in cards)
+        close=sum(1 for m in obs["mechs"] if m["kind"]=="mech" and distance(p,m["pos"])<53)
+        tiny=zone["radius"]<57
+        self.seek_specialty=not (held and held["kind"]=="laser") and not (held and held["kind"]=="lightning"
+            and (arc_levels>=2 or tiny and close>=2))
+        if self.seek_specialty or held and held["kind"]=="laser":
+            self.item_values["laser"]+=44.
+            # An alternate item can be useful while searching; a late high-card
+            # build can keep it. None of the game objects are blacklisted.
+            if not tiny:self.item_values["lightning"]=min(self.item_values["lightning"],77.)
+
+    def harvest(self,obs,goal,stop):
+        me,z,now=obs["self"],obs["zone"],obs["t"]
+        p=me["pos"];speed=max(1.,me["stats"]["walk_speed"]);self.foreground_reward=None
+        if me["cubes"]>=10 or not me["in_zone"] or me["hp"]<.48*me["max_hp"] or now>140:
+            self.work_order=None
+            return goal,stop
+        ranks=[m for m in obs["mechs"] if m["kind"]=="mech"]
+        objects=obs["crates"]+[m for m in obs["mechs"] if m["kind"]=="npc"]
+        nearby={obj["id"]:obj for obj in objects}
+        held=me["weapons"][1]
+        if not held and tuple(goal[:2]) in self.collectible_at and self.collectible_at[tuple(goal[:2])][0]=="pickups":
+            self.work_order=None
+            return goal,stop
+        possible=[]
+        for obj in objects:
+            q=obj["pos"];d=distance(p,q)
+            if d>74 or not self.reachable_reward(p,q) or now<self.stop_work.get(obj["id"],-1):continue
+            if distance(q,z["center"])>z["radius"]-5:continue
+            if min((distance(q,m["pos"]) for m in ranks),default=500.)<d*.85+8:continue
+            count=2 if obj.get("kind")=="npc" else 1
+            extra=any(me["cubes"]<k<=me["cubes"]+count for k in (1,3,6,10))
+            # A neutral token yields known cube(s); crates also roll an item.
+            # Price the complete job including travel to bank the spawned prize.
+            service=obj["hp"]/(140. if held else 85.)
+            value=count+1.45*extra+.45*(not held and count==1)
+            reward=value/(1.2+max(service,d/speed))
+            possible.append((reward,obj))
+        current=self.work_order
+        if current:
+            oid,pt,previous_hp,best_gap,seen,born=current
+            obj=nearby.get(oid)
+            if obj is None:
+                if now-seen<1.25 and distance(p,pt)>3:return pt,1.
+                self.work_order=None
+            else:
+                gap=distance(p,obj["pos"])
+                if obj["hp"]<previous_hp-2 or gap<best_gap-2:
+                    seen=now;previous_hp=obj["hp"];best_gap=gap
+                if now-seen<=1.65 and now-born<6.5 and any(o["id"]==oid for _,o in possible):
+                    self.work_order=(oid,obj["pos"],previous_hp,best_gap,seen,born)
+                    self.foreground_reward=obj
+                    return obj["pos"],4.
+                self.stop_work[oid]=now+12;self.work_order=None
+        # A bankable loose cube always beats spending time to generate one.
+        if tuple(goal[:2]) in self.collectible_at and self.collectible_at[tuple(goal[:2])][0]=="cubes":
+            return goal,stop
+        if possible:
+            score,obj=max(possible,key=lambda rec:rec[0])
+            if score>.29 and self.stop_work.get(obj["id"],-1)<now:
+                self.work_order=(obj["id"],obj["pos"],obj["hp"],distance(p,obj["pos"]),now,now)
+                self.foreground_reward=obj;return obj["pos"],4.
+        return goal,stop
 
     def act(self, obs):
         me = obs["self"]
         p, now = me["pos"], obs["t"]
         goal, stop = self.destination(obs)
         goal, stop = self.resource_sequence(obs,goal,stop)
-        if now < 100 and (not me["weapons"][1] or me["weapons"][1]["kind"]=="mortar"):
+        if now < 125 and self.seek_specialty:
             cell = 28
             if now-self.scan_tick >= .65:
                 self.scan_tick = now
@@ -459,7 +519,7 @@ class Bot:
                         if radius<35 or (radius<116 and dx*ux+dy*uy>.6*radius):
                             self.discovered_tiles.add((i,j))
             waiting = any(distance(goal,point)<8 for point in self.resource_targets)
-            known = any(it["kind"] in ("laser","lightning") and now-seen<9 and
+            known = any((it["kind"]=="laser" or not me["weapons"][1] and it["kind"]=="lightning") and now-seen<9 and
                         distance(p,it["pos"])<125 and self.reachable_reward(p,it["pos"])
                         for it,seen in self.items["pickups"].values())
             near_box = me["cubes"] < 6 and any(
@@ -505,6 +565,10 @@ class Bot:
                     self.explore_at=now
                 if self.explore_goal is not None:
                     goal,stop=self.explore_goal,0
+        if not self.seek_specialty:
+            goal,stop=self.harvest(obs,goal,stop)
+        else:
+            self.work_order=None;self.foreground_reward=None
         self.observe_collection(obs,goal)
         resting = distance(p, goal) <= max(0.6, stop)
         dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
@@ -553,6 +617,7 @@ class Bot:
             scored = [m for m in actors if m["kind"] == "mech" and distance(p, m["pos"]) < held["stats"]["range"]]
             actors = scored or actors
         objects = actors or [c for c in obs["crates"] if distance(p, c["pos"]) < 80]
+        if self.foreground_reward is not None and not rivals:objects=[self.foreground_reward]
         if objects:
             if held and held["kind"] == "laser" and rivals:
                 # One HP counter reaching zero earns a placement. Prefer a
@@ -589,7 +654,7 @@ class Bot:
         else:
             action["aim"] = [math.atan2(dy, dx) + 0.9 * math.sin(now * 0.7), 0]
             action["reload"] = primary.get("ammo", 0) < primary["stats"].get("mag", 0) * 0.7
-        self.scan_rewards(obs,action)
+        self.arrival(obs,goal,action,blocked)
         return action
 
 
