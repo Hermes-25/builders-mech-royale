@@ -55,6 +55,9 @@ class Bot:
         self.work_order=None
         self.stop_work={}
         self.foreground_reward=None
+        self.sky_style="gear"
+        self.climb=None
+        self.sky_skip={}
         self.config = hello["config"]
         self.phase = (hello["slot"] * 2.39996) % math.tau
         self.positions = deque(maxlen=12)
@@ -454,12 +457,6 @@ class Bot:
             self.work_order=None
             return goal,stop
         ranks=[m for m in obs["mechs"] if m["kind"]=="mech"]
-        # No second interaction is available while a ranked sprite owns
-        # the shared game cursor. Avoid buying travel to a job we cannot service.
-        busy_range=max((w["stats"].get("range",0.) for w in me["weapons"] if w),default=0.)
-        if any(distance(p,r["pos"])<busy_range for r in ranks):
-            self.work_order=None
-            return goal,stop
         objects=obs["crates"]+[m for m in obs["mechs"] if m["kind"]=="npc"]
         nearby={obj["id"]:obj for obj in objects}
         held=me["weapons"][1]
@@ -505,6 +502,59 @@ class Bot:
                 self.work_order=(obj["id"],obj["pos"],obj["hp"],distance(p,obj["pos"]),now,now)
                 self.foreground_reward=obj;return obj["pos"],4.
         return goal,stop
+
+    def sky_goal(self,obs,goal,stop):
+        now=obs["t"];me=obs["self"];p=me["pos"];stats=me["stats"];z=obs["zone"]
+        held=me["weapons"][1]
+        if (not me["in_zone"] or me["hp"]<.58*me["max_hp"] or
+                distance(p,z["center"])>z["radius"]-14):
+            self.climb=None;return goal,stop
+        items=obs["pickups"]+(obs["cubes"] if self.sky_style=="rewards" and me["cubes"]<6 else [])
+        sight={c["id"]:c for c in items}
+        if self.climb:
+            key,pt,born,seen,best,last=self.climb
+            obj=sight.get(key)
+            if obj is not None:seen=now;pt=obj["pos"]
+            effort=max(0.,pt[2]-p[2]-2.)+.25*distance(p,pt)
+            if effort<best-.65:best=effort;last=now
+            if (now-seen>1.25 or now-born>11.5 or now-last>1.55 or me["energy"]<10 or
+                    held and held["kind"]=="laser" and key not in {c["id"] for c in obs["cubes"]}):
+                self.sky_skip[key]=now+16.;self.climb=None
+            else:
+                self.climb=(key,pt,born,seen,best,last)
+                return pt,0.
+        if me["energy"]<35 or not me["grounded"] or self.work_order:return goal,stop
+        if tuple(goal[:2]) in self.resource_targets and distance(p,goal)<10:return goal,stop
+        options=[]
+        for obj in items:
+            q=obj["pos"];gap=distance(p,q);h=q[2]-p[2];kind=obj.get("kind","cube")
+            if kind not in ("laser","cube") or (kind=="laser" and held and held["kind"]=="laser"):continue
+            if self.sky_skip.get(obj["id"],-1)>now or not (4.3<h<26 and gap<86):continue
+            if self.surface is not None and self.surface.above_tile(q)<4.:continue
+            climb_s=h/max(1.,stats["max_rise_speed"])+.35
+            energy=stats["jet_drain"]*climb_s
+            if energy>me["energy"]-12.:continue
+            time=climb_s+max(0.,gap-9.)/max(1.,stats["walk_speed"])
+            if time>9.:continue
+            premium=(6. if kind=="laser" else (2.2 if me["cubes"] in (0,2,5) else 1.))
+            if premium/time<.62:continue
+            if gap>33 and any(r["kind"]=="mech" and distance(r["pos"],q)<gap*.6 for r in obs["mechs"]):continue
+            options.append((premium/time,obj))
+        if options:
+            _,obj=max(options,key=lambda row:row[0]);q=obj["pos"]
+            self.climb=(obj["id"],q,now,now,max(0.,q[2]-p[2]-2.)+.25*distance(p,q),now)
+            return q,0.
+        return goal,stop
+
+    def sky_motion(self,obs,action):
+        if self.climb is None:return
+        me=obs["self"];p=me["pos"];q=self.climb[1];gap=distance(p,q);h=q[2]-p[2]
+        if gap>26. or h<2.8:return
+        # Lift while moving toward the confirmed game reward; release the jet
+        # at its landing elevation. Idle states cannot spend this budget.
+        if me["grounded"]:action["jump"]=True
+        elif me["energy"]>8 and me["vel"][2]<me["stats"]["max_rise_speed"]+1:action["boost"]=True
+        dx,dy=direction(p,q);action["move"]=[dx,dy]
 
     def act(self, obs):
         me = obs["self"]
@@ -575,6 +625,7 @@ class Bot:
             goal,stop=self.harvest(obs,goal,stop)
         else:
             self.work_order=None;self.foreground_reward=None
+        goal,stop=self.sky_goal(obs,goal,stop)
         self.observe_collection(obs,goal)
         resting = distance(p, goal) <= max(0.6, stop)
         dx, dy, blocked = self.navigate(p, goal, resting, now, me["stats"]["walk_speed"])
@@ -661,6 +712,7 @@ class Bot:
             action["aim"] = [math.atan2(dy, dx) + 0.9 * math.sin(now * 0.7), 0]
             action["reload"] = primary.get("ammo", 0) < primary["stats"].get("mag", 0) * 0.7
         self.arrival(obs,goal,action,blocked)
+        self.sky_motion(obs,action)
         return action
 
 
